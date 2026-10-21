@@ -1,10 +1,21 @@
 """Only fetch a fixed status file. Never accept a remote command from the UI."""
 
+import os
 import re
 import subprocess
 from pathlib import Path
 
 from .model import decode_status
+
+
+def ssh_executable():
+    # On Windows, PATH may find Git for Windows' ssh first, which cannot use the Windows
+    # OpenSSH agent. Prefer the system client so the agent-held key works from any shell.
+    if os.name == "nt":
+        system = os.path.join(os.environ.get("SystemRoot", r"C:\Windows"), "System32", "OpenSSH", "ssh.exe")
+        if os.path.isfile(system):
+            return system
+    return "ssh"
 
 
 def ssh_command(config):
@@ -17,7 +28,7 @@ def ssh_command(config):
         raise ValueError("Invalid SSH user")
     if type(port) is not int or not 1 <= port <= 65535:
         raise ValueError("Invalid SSH port")
-    return ["ssh", "-T", "-o", "BatchMode=yes", "-o", "ConnectTimeout=10",
+    return [ssh_executable(), "-T", "-o", "BatchMode=yes", "-o", "ConnectTimeout=10",
             "-o", "StrictHostKeyChecking=yes", "-o", "ClearAllForwardings=yes",
             "-p", str(port), "--", f"{user}@{host}",
             "cat /var/lib/site-watch/status.json"]

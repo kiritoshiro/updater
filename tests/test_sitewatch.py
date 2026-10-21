@@ -8,7 +8,7 @@ import threading
 import unittest
 from unittest.mock import patch
 
-from sitewatch import collector
+from sitewatch import collector, transport
 from sitewatch.demo import sample
 from sitewatch.model import decode_status, freshness, MAX_STATUS_BYTES, numeric_version
 from sitewatch.transport import ssh_command, fetch_ssh, fetch_file
@@ -71,6 +71,21 @@ class TransportTests(unittest.TestCase):
         for key, value in [("host", "-oProxyCommand=bad"), ("host", "x;id"), ("user", "root;id"), ("user", "../root"), ("port", "22;id"), ("port", True), ("port", 65536)]:
             with self.subTest(key=key, value=value), self.assertRaises(ValueError):
                 ssh_command({**valid, key: value})
+
+    def test_windows_prefers_system_openssh(self):
+        with tempfile.TemporaryDirectory() as root:
+            os_ = __import__("os")
+            client = os_.path.join(root, "System32", "OpenSSH", "ssh.exe")
+            with patch("sitewatch.transport.os.name", "nt"), patch.dict("os.environ", {"SystemRoot": root}):
+                self.assertEqual(transport.ssh_executable(), "ssh")
+                os_.makedirs(os_.path.dirname(client))
+                open(client, "wb").close()
+                self.assertEqual(transport.ssh_executable(), client)
+                self.assertEqual(ssh_command({"host": "example.org", "user": "darius"})[0], client)
+
+    @patch("sitewatch.transport.os.name", "posix")
+    def test_other_systems_use_ssh_from_path(self):
+        self.assertEqual(transport.ssh_executable(), "ssh")
 
     @patch("sitewatch.transport.subprocess.run")
     def test_ssh_error_does_not_disclose_remote_stderr(self, run):

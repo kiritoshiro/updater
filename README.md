@@ -29,7 +29,7 @@ For SSH, copy `config/viewer.example.json` to `config.local.json`, set host/user
 python -m sitewatch --config config.local.json
 ```
 
-Use your existing OpenSSH agent and verified host key. Password prompts are disabled; the app does not read private keys, accept new host keys, or change SSH settings. Refresh retrieves the existing status file; it does not start a privileged scan. The page rechecks freshness every minute.
+Use your existing OpenSSH agent and verified host key. On Windows the viewer uses the system client, `%SystemRoot%\System32\OpenSSH\ssh.exe`, when it exists (so the Windows agent works even from Git Bash, whose own `ssh` cannot use it); elsewhere it runs `ssh` from PATH. Password prompts are disabled; the app does not read private keys, accept new host keys, or change SSH settings. Refresh retrieves the existing status file; it does not start a privileged scan. The page rechecks freshness every minute.
 
 ## Included
 
