@@ -1,0 +1,6 @@
+{
+  "webhook_url": "https://discord.com/api/webhooks/000000000000000000/replace-with-your-webhook-token",
+  "mention": null,
+  "digest_hour": 8,
+  "ignore": []
+}
