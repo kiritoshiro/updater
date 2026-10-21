@@ -40,6 +40,23 @@ function meter(parent, label, value, ratio) {
   const line = node('div', undefined, 'server-line'); line.append(node('span', label), node('strong', value)); parent.append(line);
   if (Number.isFinite(ratio)) {const bar = node('div', undefined, 'meter'), fill = node('div', undefined, 'meter-fill'); fill.style.width = `${Math.max(0, Math.min(100, ratio * 100))}%`; bar.append(fill); parent.append(bar);}
 }
+function phpText(s) {
+  const r = s.php_release;
+  if (!s.php_version) return 'Unknown';
+  if (!r) return `${s.php_version} · latest unknown`;
+  return r.update_available ? `${s.php_version} · ${r.latest} available${r.security_release ? ' (security)' : ''}` : `${s.php_version} · current`;
+}
+function aptText(apt) {
+  if (!apt) return 'Unknown';
+  if (!apt.upgradable) return 'None pending';
+  return `${apt.upgradable} pending${apt.security ? ` · ${apt.security} security` : ''}`;
+}
+function serverUpdates(s) {
+  const items = [];
+  if (s?.php_release?.update_available) items.push({name: 'PHP', type: 'runtime', source: 'php.net', version: s.php_version, update_version: s.php_release.latest});
+  for (const p of s?.apt?.packages || []) items.push({name: p.name, type: p.security ? 'security package' : 'package', source: 'apt', version: p.from, update_version: p.version});
+  return items;
+}
 function renderServer() {
   const s = snapshot?.server || {}, disk = s.disk, memory = s.memory;
   $('server-name').textContent = s.hostname || 'Server health';
@@ -47,12 +64,16 @@ function renderServer() {
     const parent = $(id); parent.replaceChildren(); parent.classList.add('server-lines');
     meter(parent, 'Disk usage', disk ? `${bytes(disk.used_bytes)} / ${bytes(disk.total_bytes)}` : 'Unknown', disk ? disk.used_bytes / disk.total_bytes : undefined);
     meter(parent, 'Memory usage', memory ? `${bytes(memory.total_bytes - memory.available_bytes)} / ${bytes(memory.total_bytes)}` : 'Unknown', memory ? (memory.total_bytes - memory.available_bytes) / memory.total_bytes : undefined);
-    meter(parent, 'PHP runtime', s.php_version || 'Unknown');
+    meter(parent, 'PHP runtime', phpText(s));
+    meter(parent, 'OS updates', aptText(s.apt));
     if (id === 'server-details') {
       meter(parent, 'Load · 1 / 5 / 15 minutes', s.load?.map(v => Number(v).toFixed(2)).join(' / ') || 'Unknown');
       meter(parent, 'Failed systemd units', Array.isArray(s.failed_units) ? s.failed_units.length ? s.failed_units.join(', ') : 'None' : 'Unknown');
+      meter(parent, 'Package lists refreshed', s.apt ? (s.apt.lists_refreshed_at ? date(s.apt.lists_refreshed_at) : 'No successful apt update recorded') : 'Unknown');
+      if (s.apt && !s.apt.lists_refreshed_at) parent.append(node('p', 'Pending updates are only as current as the last successful apt update. Enable apt-daily.timer or run apt update.', 'detail-error'));
+      if (s.php_release?.branch_supported === false) parent.append(node('p', `PHP ${s.php_release.branch} no longer receives security fixes from php.net.`, 'detail-error'));
       for (const error of s.errors || []) parent.append(node('p', error, 'detail-error'));
-      parent.append(node('p', 'OS updates, mail, certificates, firewall, FPM and remote backup verification are planned for a later collector release.', 'detail-note'));
+      parent.append(node('p', 'Mail, certificates, firewall, FPM and remote backup verification are planned for a later collector release.', 'detail-note'));
     }
   }
 }
@@ -61,6 +82,11 @@ function renderUpdates() {
   for (const site of snapshot?.sites || []) for (const item of updates(site)) {
     const row = node('div', undefined, 'update-item'), name = node('div', item.name);
     name.append(node('small', `${site.id} · ${item.type} · ${item.source || 'wordpress.org'}`));
+    row.append(name, node('span', `${item.version || '?'} → ${item.update_version}`, 'version-change')); list.append(row);
+  }
+  for (const item of serverUpdates(snapshot?.server)) {
+    const row = node('div', undefined, 'update-item'), name = node('div', item.name);
+    name.append(node('small', `${snapshot.server.hostname || 'server'} · ${item.type} · ${item.source}`));
     row.append(name, node('span', `${item.version || '?'} → ${item.update_version}`, 'version-change')); list.append(row);
   }
   if (!list.children.length) list.append(node('p', 'No updates reported in this snapshot. Unavailable or unmapped vendor checks may still need attention.', 'detail-note'));

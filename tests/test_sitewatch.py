@@ -214,6 +214,47 @@ class CollectorTests(unittest.TestCase):
     def test_unreadable_config_flags_unknown(self, _):
         self.assertEqual(set(collector.security_flags({}).values()), {None})
 
+    def test_github_mappings_inherit_and_exclude(self):
+        config = collector.validate_config({
+            "origin_ip": "203.0.113.10", "github": {"theme:adventistai": "kiritoshiro/Adventistai-ALPS", "plugin:alps-gutenberg-blocks": "kiritoshiro/blocks"},
+            "sites": [{"id": "a.example.org", "kind": "web"},
+                      {"id": "b.example.org", "kind": "web", "github": {"plugin:alps-gutenberg-blocks": None, "plugin:extra": "kiritoshiro/extra"}}]})
+        self.assertEqual(config["sites"][0]["github"], {"theme:adventistai": "kiritoshiro/Adventistai-ALPS", "plugin:alps-gutenberg-blocks": "kiritoshiro/blocks"})
+        self.assertEqual(config["sites"][1]["github"], {"theme:adventistai": "kiritoshiro/Adventistai-ALPS", "plugin:extra": "kiritoshiro/extra"})
+        for bad in ({"plugin:x": "no-slash"}, {"bad key": "a/b"}, ["a/b"]):
+            with self.subTest(bad=bad), self.assertRaises(ValueError):
+                collector.validate_config({"origin_ip": "203.0.113.10", "github": bad, "sites": [{"id": "a.example.org", "kind": "web"}]})
+
+    @patch("sitewatch.collector.fetch_json", return_value={"version": "8.4.27", "tags": ["security"], "supported_versions": ["8.3", "8.4", "8.5"]})
+    def test_php_release_compares_same_branch(self, fetch):
+        self.assertEqual(collector.php_release("8.4.26"), {"branch": "8.4", "latest": "8.4.27", "update_available": True,
+                                                           "branch_supported": True, "security_release": True})
+        self.assertIn("version=8.4", fetch.call_args.args[0])
+        self.assertFalse(collector.php_release("8.4.27")["update_available"])
+
+    @patch("sitewatch.collector.fetch_json", return_value={"version": "8.5.12"})
+    def test_php_release_rejects_other_branch(self, _):
+        with self.assertRaises(collector.CheckFailed):
+            collector.php_release("8.4.26")
+
+    @patch("sitewatch.collector.fetch_json", side_effect=OSError("offline"))
+    def test_php_release_unavailable(self, _):
+        with self.assertRaises(collector.CheckFailed):
+            collector.php_release("8.4.26")
+
+    @patch("sitewatch.collector.run", return_value="Listing...\n"
+           "php8.4-fpm/noble 8.4.27-1+ubuntu24.04.1+deb.sury.org+1 amd64 [upgradable from: 8.4.26-1+ubuntu24.04.1+deb.sury.org+1]\n"
+           "libssl3t64/noble-updates,noble-security 3.0.13-0ubuntu3.6 amd64 [upgradable from: 3.0.13-0ubuntu3.5]\n"
+           "evil;rm/noble 1 amd64 [upgradable from: 0]\n")
+    def test_apt_status_parses_upgradable(self, run):
+        status = collector.apt_status()
+        self.assertEqual(run.call_args.args[0], ["/usr/bin/apt", "list", "--upgradable"])
+        self.assertEqual(status["upgradable"], 2)
+        self.assertEqual(status["security"], 1)
+        self.assertEqual(status["packages"][0], {"name": "php8.4-fpm", "version": "8.4.27-1+ubuntu24.04.1+deb.sury.org+1",
+                                                 "from": "8.4.26-1+ubuntu24.04.1+deb.sury.org+1", "security": False})
+        self.assertIn("lists_refreshed_at", status)
+
     def test_ignore_failed_units_validated(self):
         base = {"origin_ip": "203.0.113.10", "sites": [{"id": "example.org", "kind": "web"}]}
         collector.validate_config({**base, "ignore_failed_units": ["user@*.service"]})
@@ -222,8 +263,9 @@ class CollectorTests(unittest.TestCase):
                 collector.validate_config({**base, "ignore_failed_units": bad})
 
     @unittest.skipUnless(hasattr(__import__('os'), "getloadavg"), "Unix load average")
+    @patch("sitewatch.collector.php_release", return_value={"branch": "8.4", "latest": "8.4.26", "update_available": False})
     @patch("sitewatch.collector.run")
-    def test_ignored_failed_units_filtered(self, run):
+    def test_ignored_failed_units_filtered(self, run, _):
         run.side_effect = lambda argv, timeout=65: ("8.4.26" if "php" in argv[0] else
                                                    "user@1001.service loaded failed failed User Manager\nnginx.service loaded failed failed nginx")
         info = collector.server_info({"ignore_failed_units": ["user@*.service"]})

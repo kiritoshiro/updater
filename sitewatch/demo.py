@@ -20,6 +20,11 @@ def sample():
                       "notes": ["Sample data only"]})
     return {"schema_version": 1, "collected_at": utcnow(), "demo": True,
             "server": {"id": "demo-server", "hostname": "Server preview", "php_version": "8.4.0",
+                       "php_release": {"branch": "8.4", "latest": "8.4.1", "update_available": True,
+                                       "branch_supported": True, "security_release": True},
+                       "apt": {"upgradable": 2, "security": 1, "lists_refreshed_at": utcnow(),
+                               "packages": [{"name": "openssl", "version": "3.0.13-0ubuntu3.6", "from": "3.0.13-0ubuntu3.5", "security": True},
+                                            {"name": "tzdata", "version": "2026b-1", "from": "2026a-1", "security": False}]},
                        "disk": {"total_bytes": 53687091200, "used_bytes": 19327352832, "free_bytes": 34359738368},
                        "memory": {"total_bytes": 4294967296, "available_bytes": 1717986918},
                        "load": [0.48, 0.62, 0.51], "failed_units": [], "errors": []}, "sites": sites}

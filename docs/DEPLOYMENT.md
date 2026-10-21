@@ -20,7 +20,9 @@ Origins behind Cloudflare often serve a **Cloudflare Origin CA** certificate, wh
 
 `ignore_failed_units` (optional) lists `fnmatch` patterns of systemd units whose failures are expected on this host, such as `user@*.service` on OpenVZ containers. Origin checks run **on the server** with SNI and certificate verification, using `curl --resolve`, no proxy, no redirect following, and no Cloudflare cache.
 
-GitHub mapping keys are `plugin:<installed-slug>` and `theme:<installed-slug>`; values are public `owner/repository` identifiers. Private repositories/tokens are not supported yet. Optional `backup_directory` reports only the newest local file's time and size; it does not verify the archive or inspect remote Drive backups.
+GitHub mapping keys are `plugin:<installed-slug>` and `theme:<installed-slug>`; values are public `owner/repository` identifiers. A top-level `github` map applies to every site where that slug is installed; a site's own `github` adds entries or maps a slug to `null` when that site's copy comes from elsewhere (e.g. an upstream build with the same folder name). Private repositories/tokens are not supported yet.
+
+The server panel also reports PHP against php.net's latest release of the installed branch (an HTTPS request to php.net per run) and pending package upgrades from `apt list --upgradable`. The collector never runs `apt update`; pending upgrades are only as current as the last successful update, shown as "Package lists refreshed" (from `/var/lib/apt/periodic/update-success-stamp`). Keep `apt-daily.timer` enabled so the lists refresh daily. Optional `backup_directory` reports only the newest local file's time and size; it does not verify the archive or inspect remote Drive backups.
 
 Grant the viewer's existing SSH user membership in `sitewatch`, then reconnect SSH. Replace the placeholder:
 

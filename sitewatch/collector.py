@@ -87,9 +87,16 @@ def validate_config(config):
                 raise ValueError("Set a valid non-root site owner")
             if not Path(site.get("path", "")).is_absolute():
                 raise ValueError("Site paths must be absolute")
-        for key, repository in site.get("github", {}).items():
-            if not re.fullmatch(r"(?:plugin|theme):[a-zA-Z0-9_.-]+", key) or not re.fullmatch(r"[a-zA-Z0-9_.-]+/[a-zA-Z0-9_.-]+", repository):
+        # Top-level mappings apply to every site that has the slug installed; a site maps a slug
+        # to null when its copy comes from elsewhere (e.g. an upstream build of the same plugin).
+        if not isinstance(config.get("github", {}), dict) or not isinstance(site.get("github", {}), dict):
+            raise ValueError("github must map plugin:/theme: slugs to owner/repository")
+        mapping = {**config.get("github", {}), **site.get("github", {})}
+        for key, repository in mapping.items():
+            if not re.fullmatch(r"(?:plugin|theme):[a-zA-Z0-9_.-]+", key) or not (
+                    repository is None or re.fullmatch(r"[a-zA-Z0-9_.-]+/[a-zA-Z0-9_.-]+", str(repository))):
                 raise ValueError("Invalid GitHub slug-to-repository mapping")
+        site["github"] = {key: repository for key, repository in mapping.items() if repository is not None}
     patterns = config.get("ignore_failed_units", [])
     if not isinstance(patterns, list) or not all(isinstance(p, str) and re.fullmatch(r"[a-zA-Z0-9@_.*?-]{1,100}", p) for p in patterns):
         raise ValueError("ignore_failed_units must be a list of unit name patterns")
@@ -130,16 +137,20 @@ class NoRedirect(HTTPRedirectHandler):
         return None
 
 
+def fetch_json(url, accept="application/json", limit=256 * 1024):
+    """Small HTTPS JSON read: no redirects, bounded size and time."""
+    request = Request(url, headers={"Accept": accept, "User-Agent": "wp-site-watch/0.1"})
+    with build_opener(NoRedirect()).open(request, timeout=12) as response:
+        raw = response.read(limit + 1)
+    if len(raw) > limit:
+        raise ValueError("Oversized response")
+    return json.loads(raw)
+
+
 def github_version(repository):
     # Public releases only in v0.1. No token is needed or accepted in viewer config.
-    request = Request(f"https://api.github.com/repos/{repository}/releases/latest",
-                      headers={"Accept": "application/vnd.github+json", "User-Agent": "wp-site-watch/0.1"})
     try:
-        with build_opener(NoRedirect()).open(request, timeout=12) as response:
-            raw = response.read(256 * 1024 + 1)
-        if len(raw) > 256 * 1024:
-            raise ValueError("Oversized response")
-        release = json.loads(raw)
+        release = fetch_json(f"https://api.github.com/repos/{repository}/releases/latest", "application/vnd.github+json")
         if release.get("draft") or release.get("prerelease"):
             raise ValueError("Not a stable release")
         tag = release["tag_name"]
@@ -301,11 +312,55 @@ def collect_site(site, config, releases):
     return result
 
 
+def php_release(version):
+    """Compare the installed PHP with php.net's latest release of the same branch."""
+    current = numeric_version(version)
+    if current is None:
+        raise CheckFailed("PHP version unknown")
+    branch = f"{current[0]}.{current[1]}"
+    try:
+        data = fetch_json(f"https://www.php.net/releases/index.php?json&version={branch}")
+        latest = str(data["version"])
+        if numeric_version(latest) is None or not latest.startswith(branch + "."):
+            raise ValueError("Unexpected release data")
+        supported = data.get("supported_versions")
+    except (OSError, ValueError, KeyError, TypeError) as exc:
+        raise CheckFailed("PHP release check unavailable") from exc
+    return {"branch": branch, "latest": latest, "update_available": numeric_version(latest) > current,
+            "branch_supported": branch in supported if isinstance(supported, list) else None,
+            "security_release": "security" in data.get("tags", []) if isinstance(data.get("tags"), list) else None}
+
+
+# `apt list --upgradable` line: name/suite[,suite] version arch [upgradable from: version]
+APT_UPGRADABLE = re.compile(r"([a-z0-9][a-z0-9+.-]*)/(\S+) (\S+) \S+ \[upgradable from: ([^\]]+)\]\Z")
+DEB_VERSION = re.compile(r"[a-zA-Z0-9.+:~-]{1,100}\Z")
+
+
+def apt_status():
+    """Pending package upgrades from apt's cached lists. Read-only: never runs apt update."""
+    output = run(["/usr/bin/apt", "list", "--upgradable"], timeout=60)
+    packages = []
+    for line in output.splitlines():
+        match = APT_UPGRADABLE.match(line.strip())
+        if match and DEB_VERSION.fullmatch(match[3]) and DEB_VERSION.fullmatch(match[4]):
+            packages.append({"name": match[1], "version": match[3], "from": match[4],
+                             "security": "-security" in match[2]})
+    # Ubuntu touches this stamp after every fully successful `apt update` (manual or apt-daily).
+    stamp = Path("/var/lib/apt/periodic/update-success-stamp")
+    try:
+        refreshed = datetime.fromtimestamp(stamp.stat().st_mtime, timezone.utc).isoformat(timespec="seconds")
+    except OSError:
+        refreshed = None
+    return {"upgradable": len(packages), "security": sum(p["security"] for p in packages),
+            "packages": packages[:200], "lists_refreshed_at": refreshed}
+
+
 def server_info(config):
     disk = shutil.disk_usage("/")
     result = {"id": safe_text(config.get("server_id", "server")), "hostname": safe_text(socket.gethostname()),
               "disk": {"total_bytes": disk.total, "used_bytes": disk.used, "free_bytes": disk.free},
-              "memory": None, "load": list(os.getloadavg()), "php_version": None, "failed_units": None, "errors": []}
+              "memory": None, "load": list(os.getloadavg()), "php_version": None, "php_release": None,
+              "apt": None, "failed_units": None, "errors": []}
     try:
         info = dict((key, int(value.strip().split()[0]) * 1024) for key, value in
                     (line.split(":", 1) for line in Path("/proc/meminfo").read_text().splitlines()))
@@ -317,6 +372,15 @@ def server_info(config):
         result["php_version"] = safe_text(run(["/usr/bin/php", "-n", "-r", "echo PHP_VERSION;"], timeout=10), version=True)
     except CheckFailed:
         result["errors"].append("PHP version unavailable")
+    if result["php_version"]:
+        try:
+            result["php_release"] = php_release(result["php_version"])
+        except CheckFailed:
+            result["errors"].append("PHP release check unavailable")
+    try:
+        result["apt"] = apt_status()
+    except CheckFailed:
+        result["errors"].append("Package update list unavailable")
     try:
         units = run(["/usr/bin/systemctl", "--failed", "--no-legend", "--plain", "--no-pager"], timeout=10)
         # Container hosts (e.g. OpenVZ) report harmless failures such as user@<uid>.service.

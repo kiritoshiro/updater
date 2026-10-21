@@ -3,6 +3,9 @@
   "origin_ip": "203.0.113.10",
   "ca_file": "/etc/site-watch/cloudflare-origin-ca.pem",
   "ignore_failed_units": ["user@*.service"],
+  "github": {
+    "theme:example-theme": "your-account/your-theme"
+  },
   "sites": [
     {
       "id": "example.org",
@@ -11,8 +14,8 @@
       "path": "/home/example/public_html",
       "health_paths": ["/", "/wp-login.php", "/category/news/"],
       "github": {
-        "theme:example-theme": "your-account/your-theme",
-        "plugin:example-plugin": "your-account/your-plugin"
+        "plugin:example-plugin": "your-account/your-plugin",
+        "plugin:upstream-build": null
       }
     },
     {
