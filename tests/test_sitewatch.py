@@ -158,6 +158,62 @@ class CollectorTests(unittest.TestCase):
         config = collector.validate_config({"origin_ip": "203.0.113.10", "sites": [dict(site), {**site, "id": "b.example.org", "origin_ip": "198.51.100.7"}]})
         self.assertEqual([s["origin_ip"] for s in config["sites"]], ["203.0.113.10", "198.51.100.7"])
 
+    def test_ca_file_inherited_overridable_and_validated(self):
+        site = {"id": "example.org", "kind": "web"}
+        config = collector.validate_config({"origin_ip": "203.0.113.10", "ca_file": "/etc/site-watch/ca.pem",
+                                            "sites": [dict(site), {**site, "id": "le.example.org", "ca_file": None}]})
+        self.assertEqual([s["ca_file"] for s in config["sites"]], ["/etc/site-watch/ca.pem", None])
+        for bad in ("relative.pem", "/etc/../tmp/ca.pem", 5):
+            with self.subTest(bad=bad), self.assertRaises(ValueError):
+                collector.validate_config({"origin_ip": "203.0.113.10", "ca_file": bad, "sites": [dict(site)]})
+
+    @patch("sitewatch.collector.run", return_value="200 0.05")
+    def test_origin_check_passes_ca_file_and_keeps_verification(self, run):
+        collector.origin_health("example.org", "203.0.113.10", "/", "/etc/site-watch/ca.pem")
+        cmd = run.call_args.args[0]
+        self.assertEqual(cmd[cmd.index("--cacert") + 1], "/etc/site-watch/ca.pem")
+        self.assertNotIn("--insecure", cmd)
+        self.assertNotIn("-k", cmd)
+        collector.origin_health("example.org", "203.0.113.10", "/")
+        self.assertNotIn("--cacert", run.call_args.args[0])
+
+    def test_component_names_with_spaces_kept(self):
+        errors = []
+        rows = collector.inventory([{"name": "old alps-wordpress-v3 v2", "version": "3.14.3.0", "status": "inactive"},
+                                    {"name": "../etc", "version": "1"}, {"name": "bad\nname"}], "theme", {}, {}, errors)
+        self.assertEqual([r["name"] for r in rows], ["old alps-wordpress-v3 v2"])
+        self.assertEqual(len(errors), 2)
+
+    @patch("sitewatch.collector.wp")
+    def test_undefined_constants_are_false_not_unknown(self, wp):
+        def fake(site, *args):
+            if args[:2] == ("config", "list"):
+                return json.dumps([{"name": "DB_NAME", "type": "constant"}, {"name": "WP_DEBUG", "type": "constant"},
+                                   {"name": "table_prefix", "type": "variable"}])
+            return "1"
+        wp.side_effect = fake
+        self.assertEqual(collector.security_flags({}), {"DISALLOW_FILE_MODS": False, "DISALLOW_FILE_EDIT": False, "WP_DEBUG": True})
+        self.assertNotIn("--fields=name,value,type", json.dumps([c.args for c in wp.call_args_list]))
+
+    @patch("sitewatch.collector.wp", side_effect=collector.CheckFailed("unreadable"))
+    def test_unreadable_config_flags_unknown(self, _):
+        self.assertEqual(set(collector.security_flags({}).values()), {None})
+
+    def test_ignore_failed_units_validated(self):
+        base = {"origin_ip": "203.0.113.10", "sites": [{"id": "example.org", "kind": "web"}]}
+        collector.validate_config({**base, "ignore_failed_units": ["user@*.service"]})
+        for bad in ("user@*.service", ["a b"], [5]):
+            with self.subTest(bad=bad), self.assertRaises(ValueError):
+                collector.validate_config({**base, "ignore_failed_units": bad})
+
+    @unittest.skipUnless(hasattr(__import__('os'), "getloadavg"), "Unix load average")
+    @patch("sitewatch.collector.run")
+    def test_ignored_failed_units_filtered(self, run):
+        run.side_effect = lambda argv, timeout=65: ("8.4.26" if "php" in argv[0] else
+                                                   "user@1001.service loaded failed failed User Manager\nnginx.service loaded failed failed nginx")
+        info = collector.server_info({"ignore_failed_units": ["user@*.service"]})
+        self.assertEqual(info["failed_units"], ["nginx.service"])
+
 
 class ViewerTests(unittest.TestCase):
     def setUp(self):

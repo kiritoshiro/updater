@@ -1,6 +1,8 @@
 {
   "server_id": "primary-server",
   "origin_ip": "203.0.113.10",
+  "ca_file": "/etc/site-watch/cloudflare-origin-ca.pem",
+  "ignore_failed_units": ["user@*.service"],
   "sites": [
     {
       "id": "example.org",
@@ -16,6 +18,7 @@
     {
       "id": "app.example.org",
       "kind": "web",
+      "ca_file": null,
       "health_paths": ["/"]
     }
   ]

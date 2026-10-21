@@ -14,7 +14,11 @@ sudo install -d -o root -g sitewatch -m 0750 /var/lib/site-watch
 sudo install -o root -g root -m 0600 config/collector.example.json /etc/site-watch/collector.json
 ```
 
-Edit `/etc/site-watch/collector.json` as root. Set all five WordPress domains with their verified Unix owners and absolute document roots. Add non-WordPress sites with `kind: web`. Set `origin_ip` (top level, or per site to override) to the address nginx listens on for HTTPS; check with `ss -ltn 'sport = :443'`. It is required and has no default: `127.0.0.1` works only if nginx listens there. Origin checks run **on the server** with SNI and certificate verification, using `curl --resolve`, no proxy, no redirect following, and no Cloudflare cache.
+Edit `/etc/site-watch/collector.json` as root. Set all five WordPress domains with their verified Unix owners and absolute document roots. Add non-WordPress sites with `kind: web`. Set `origin_ip` (top level, or per site to override) to the address nginx listens on for HTTPS; check with `ss -ltn 'sport = :443'`. It is required and has no default: `127.0.0.1` works only if nginx listens there.
+
+Origins behind Cloudflare often serve a **Cloudflare Origin CA** certificate, which the system trust store does not include, so every check would fail TLS verification. Set `ca_file` (top level, or per site) to Cloudflare's Origin CA root, installed root-owned, e.g. `sudo install -o root -g root -m 0644 origin_ca_rsa_root.pem /etc/site-watch/cloudflare-origin-ca.pem`, from https://developers.cloudflare.com/ssl/static/origin_ca_rsa_root.pem (compare its fingerprint with Cloudflare's documentation). Sites with publicly trusted certificates (e.g. Let's Encrypt) set `"ca_file": null`. Find which issuer a site uses with `openssl s_client -connect <origin_ip>:443 -servername <site> </dev/null | openssl x509 -noout -issuer`. Verification is never disabled.
+
+`ignore_failed_units` (optional) lists `fnmatch` patterns of systemd units whose failures are expected on this host, such as `user@*.service` on OpenVZ containers. Origin checks run **on the server** with SNI and certificate verification, using `curl --resolve`, no proxy, no redirect following, and no Cloudflare cache.
 
 GitHub mapping keys are `plugin:<installed-slug>` and `theme:<installed-slug>`; values are public `owner/repository` identifiers. Private repositories/tokens are not supported yet. Optional `backup_directory` reports only the newest local file's time and size; it does not verify the archive or inspect remote Drive backups.
 

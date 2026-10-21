@@ -7,6 +7,7 @@ WP-CLI update checks may refresh WordPress's update transients.
 import argparse
 from contextlib import contextmanager
 from datetime import datetime, timezone
+import fnmatch
 import ipaddress
 import json
 import os
@@ -19,7 +20,7 @@ import subprocess
 import tempfile
 from urllib.request import Request, build_opener, HTTPRedirectHandler
 
-from .model import DOMAIN, SLUG, numeric_version, utcnow, validate_status
+from .model import DOMAIN, numeric_version, utcnow, validate_status
 
 
 class CheckFailed(Exception):
@@ -47,13 +48,13 @@ def safe_text(value, version=False):
 def load_config(path):
     path = Path(path).resolve(strict=True)
     # Privileged configuration and its parents must not be replaceable by a site user.
-    for entry in (path, *path.parents):
-        info = entry.stat()
-        if info.st_uid != 0 or info.st_mode & 0o022:
-            raise ValueError("Collector config and parent directories must be root-owned and not group/world writable")
+    check_root_file(path)
     if path.stat().st_mode & 0o077:
         raise ValueError("Collector config must have mode 0600")
-    return validate_config(json.loads(path.read_text(encoding="utf-8")))
+    config = validate_config(json.loads(path.read_text(encoding="utf-8")))
+    for ca_file in {site["ca_file"] for site in config["sites"] if site["ca_file"]}:
+        check_root_file(ca_file)
+    return config
 
 
 def validate_config(config):
@@ -71,6 +72,11 @@ def validate_config(config):
             raise ValueError("Set origin_ip to the address nginx listens on for HTTPS")
         ipaddress.ip_address(origin)
         site["origin_ip"] = origin
+        # Extra CA for origin TLS, e.g. Cloudflare Origin CA. A site sets null to use the system store.
+        ca_file = site["ca_file"] if "ca_file" in site else config.get("ca_file")
+        if ca_file is not None and (not isinstance(ca_file, str) or not ca_file.startswith("/") or ".." in ca_file):
+            raise ValueError("ca_file must be an absolute path or null")
+        site["ca_file"] = ca_file
         if site.get("kind", "wordpress") not in ("wordpress", "web"):
             raise ValueError("Site kind must be wordpress or web")
         for check_path in site.get("health_paths", ["/", "/wp-login.php"]):
@@ -84,7 +90,19 @@ def validate_config(config):
         for key, repository in site.get("github", {}).items():
             if not re.fullmatch(r"(?:plugin|theme):[a-zA-Z0-9_.-]+", key) or not re.fullmatch(r"[a-zA-Z0-9_.-]+/[a-zA-Z0-9_.-]+", repository):
                 raise ValueError("Invalid GitHub slug-to-repository mapping")
+    patterns = config.get("ignore_failed_units", [])
+    if not isinstance(patterns, list) or not all(isinstance(p, str) and re.fullmatch(r"[a-zA-Z0-9@_.*?-]{1,100}", p) for p in patterns):
+        raise ValueError("ignore_failed_units must be a list of unit name patterns")
     return config
+
+
+def check_root_file(path):
+    """A file root reads on the collector's behalf must not be replaceable by a site user."""
+    path = Path(path).resolve(strict=True)
+    for entry in (path, *path.parents):
+        info = entry.stat()
+        if info.st_uid != 0 or info.st_mode & 0o022:
+            raise ValueError("Files used by the collector must be root-owned and not group/world writable")
 
 
 def validate_owner(site):
@@ -132,12 +150,17 @@ def github_version(repository):
         raise CheckFailed("GitHub release check unavailable") from exc
 
 
+# Installed folder names may contain spaces (e.g. a renamed "old theme"); still no control or
+# path characters. Update actions must validate their own arguments against model.SLUG.
+COMPONENT_NAME = re.compile(r"[a-zA-Z0-9][a-zA-Z0-9_. -]{0,199}\Z", re.ASCII)
+
+
 def inventory(rows, kind, mapping, releases, errors):
     if not isinstance(rows, list):
         raise CheckFailed("Invalid component inventory")
     result = []
     for row in rows:
-        if not isinstance(row, dict) or not SLUG.fullmatch(str(row.get("name", ""))):
+        if not isinstance(row, dict) or not COMPONENT_NAME.fullmatch(str(row.get("name", ""))):
             errors.append(f"Invalid {kind} row omitted")
             continue
         name = row["name"]
@@ -179,14 +202,15 @@ def critical_error_page(content):
     return 'id="error-page"' in content and any(text in content for text in CRITICAL_ERROR_MESSAGES)
 
 
-def origin_health(domain, origin, path):
+def origin_health(domain, origin, path, ca_file=None):
     address = f"[{origin}]" if ":" in origin else origin
+    trust = ["--cacert", ca_file] if ca_file else []
     try:
         with tempfile.TemporaryDirectory(prefix="site-watch-health-") as directory:
             body = Path(directory) / "body"
             output = run(["/usr/bin/curl", "--silent", "--show-error", "--noproxy", "*",
                           "--connect-timeout", "5", "--max-time", "12", "--max-filesize", "2097152",
-                          "--proto", "=https", "--resolve", f"{domain}:443:{address}",
+                          "--proto", "=https", "--resolve", f"{domain}:443:{address}", *trust,
                           "--header", "Cache-Control: no-cache", "--output", str(body),
                           "--write-out", "%{http_code} %{time_total}", f"https://{domain}{path}"], timeout=15)
             code, elapsed = output.split()
@@ -210,6 +234,30 @@ def backup_info(site):
                 "size_bytes": info.st_size, "verified": False}
     except (OSError, ValueError):
         return {"state": "unknown"}
+
+
+SECURITY_FLAGS = ("DISALLOW_FILE_MODS", "DISALLOW_FILE_EDIT", "WP_DEBUG")
+
+
+def security_flags(site):
+    """True/False per constant; a constant missing from wp-config.php is WordPress's default, False.
+    None means wp-config.php could not be read. Only names are listed, never values of other keys."""
+    try:
+        rows = json.loads(wp(site, "config", "list", "--fields=name,type", "--format=json"))
+        defined = {r["name"] for r in rows if isinstance(r, dict) and r.get("type") == "constant"}
+    except (CheckFailed, ValueError, TypeError, KeyError):
+        return {flag: None for flag in SECURITY_FLAGS}
+    flags = {}
+    for flag in SECURITY_FLAGS:
+        if flag not in defined:
+            flags[flag] = False
+            continue
+        try:
+            value = wp(site, "config", "get", flag, "--type=constant").lower()
+            flags[flag] = {"true": True, "1": True, "false": False, "0": False, "": False}.get(value)
+        except CheckFailed:
+            flags[flag] = None
+    return flags
 
 
 def collect_site(site, config, releases):
@@ -240,17 +288,12 @@ def collect_site(site, config, releases):
                 result[key] = inventory(rows, kind, site.get("github", {}), releases, errors)
             except (CheckFailed, ValueError, TypeError):
                 errors.append(f"{kind.capitalize()} inventory unavailable")
-        for flag in ("DISALLOW_FILE_MODS", "DISALLOW_FILE_EDIT", "WP_DEBUG"):
-            try:
-                value = wp(site, "config", "get", flag, "--type=constant").lower()
-                result["flags"][flag] = {"true": True, "1": True, "false": False, "0": False, "": False}.get(value)
-            except CheckFailed:
-                result["flags"][flag] = None
+        result["flags"] = security_flags(site)
         result["notes"].append("WP-CLI skips regular plugins and themes; must-use plugins and drop-ins can still load, as the site owner.")
         result["notes"].append("No reported update does not verify currency for vendor plugins without a configured GitHub mapping.")
     paths = site.get("health_paths", ["/", "/wp-login.php"] if result["kind"] == "wordpress" else ["/"])
     for path in paths:
-        result["health"].append(origin_health(site["id"], site["origin_ip"], path))
+        result["health"].append(origin_health(site["id"], site["origin_ip"], path, site.get("ca_file")))
     if any(not h["ok"] for h in result["health"]):
         result["state"] = "unhealthy"
     elif errors:
@@ -276,7 +319,10 @@ def server_info(config):
         result["errors"].append("PHP version unavailable")
     try:
         units = run(["/usr/bin/systemctl", "--failed", "--no-legend", "--plain", "--no-pager"], timeout=10)
-        result["failed_units"] = [safe_text(line.split()[0]) for line in units.splitlines() if line.strip()]
+        # Container hosts (e.g. OpenVZ) report harmless failures such as user@<uid>.service.
+        ignored = config.get("ignore_failed_units", [])
+        names = [line.split()[0] for line in units.splitlines() if line.strip()]
+        result["failed_units"] = [safe_text(name) for name in names if not any(fnmatch.fnmatchcase(name, p) for p in ignored)]
     except CheckFailed:
         result["errors"].append("Service status unavailable")
     return result
