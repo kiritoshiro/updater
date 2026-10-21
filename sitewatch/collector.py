@@ -53,7 +53,10 @@ def load_config(path):
             raise ValueError("Collector config and parent directories must be root-owned and not group/world writable")
     if path.stat().st_mode & 0o077:
         raise ValueError("Collector config must have mode 0600")
-    config = json.loads(path.read_text(encoding="utf-8"))
+    return validate_config(json.loads(path.read_text(encoding="utf-8")))
+
+
+def validate_config(config):
     if not isinstance(config.get("sites"), list) or not config["sites"]:
         raise ValueError("Configure at least one site")
     seen = set()
@@ -62,7 +65,12 @@ def load_config(path):
         if not isinstance(domain, str) or not DOMAIN.fullmatch(domain) or ".." in domain or domain in seen:
             raise ValueError("Site IDs must be unique hostnames")
         seen.add(domain)
-        ipaddress.ip_address(site.get("origin_ip", config.get("origin_ip", "127.0.0.1")))
+        # No default: nginx may not listen on loopback, and a wrong guess reports every site down.
+        origin = site.get("origin_ip", config.get("origin_ip"))
+        if not isinstance(origin, str):
+            raise ValueError("Set origin_ip to the address nginx listens on for HTTPS")
+        ipaddress.ip_address(origin)
+        site["origin_ip"] = origin
         if site.get("kind", "wordpress") not in ("wordpress", "web"):
             raise ValueError("Site kind must be wordpress or web")
         for check_path in site.get("health_paths", ["/", "/wp-login.php"]):
@@ -161,6 +169,16 @@ def inventory(rows, kind, mapping, releases, errors):
     return result
 
 
+# WordPress's fatal-error screen in the languages our sites use. Pages that merely mention the
+# words (posts, search results) are not errors, so the wp_die() page marker is also required.
+CRITICAL_ERROR_MESSAGES = ("there has been a critical error on this website", "tinklalapyje įvyko kritinė klaida")
+
+
+def critical_error_page(content):
+    content = content.lower()
+    return 'id="error-page"' in content and any(text in content for text in CRITICAL_ERROR_MESSAGES)
+
+
 def origin_health(domain, origin, path):
     address = f"[{origin}]" if ":" in origin else origin
     try:
@@ -173,7 +191,7 @@ def origin_health(domain, origin, path):
                           "--write-out", "%{http_code} %{time_total}", f"https://{domain}{path}"], timeout=15)
             code, elapsed = output.split()
             content = body.read_bytes()[:2097152].decode("utf-8", errors="replace").lower()
-        critical = any(text in content for text in ("critical error", "kritinė klaida", "kritine klaida"))
+        critical = critical_error_page(content)
         return {"path": path, "status": int(code), "response_ms": round(float(elapsed) * 1000),
                 "ok": 200 <= int(code) < 400 and not critical, "critical_error": critical}
     except (CheckFailed, OSError, ValueError):
@@ -232,7 +250,7 @@ def collect_site(site, config, releases):
         result["notes"].append("No reported update does not verify currency for vendor plugins without a configured GitHub mapping.")
     paths = site.get("health_paths", ["/", "/wp-login.php"] if result["kind"] == "wordpress" else ["/"])
     for path in paths:
-        result["health"].append(origin_health(site["id"], site.get("origin_ip", config.get("origin_ip", "127.0.0.1")), path))
+        result["health"].append(origin_health(site["id"], site["origin_ip"], path))
     if any(not h["ok"] for h in result["health"]):
         result["state"] = "unhealthy"
     elif errors:

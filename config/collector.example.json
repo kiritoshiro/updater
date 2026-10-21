@@ -1,6 +1,6 @@
 {
   "server_id": "primary-server",
-  "origin_ip": "127.0.0.1",
+  "origin_ip": "203.0.113.10",
   "sites": [
     {
       "id": "example.org",

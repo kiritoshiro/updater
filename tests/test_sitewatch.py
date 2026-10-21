@@ -128,7 +128,7 @@ class CollectorTests(unittest.TestCase):
     @patch("sitewatch.collector.wp", side_effect=collector.CheckFailed("DB_PASSWORD=secret"))
     @patch("sitewatch.collector.origin_health", return_value={"path": "/", "ok": True, "status": 200})
     def test_fatal_wordpress_is_partial_and_keeps_origin(self, *_):
-        data = collector.collect_site({"id": "example.org", "owner": "example", "path": "/home/example/public_html"}, {}, {})
+        data = collector.collect_site({"id": "example.org", "owner": "example", "path": "/home/example/public_html", "origin_ip": "203.0.113.10"}, {}, {})
         self.assertEqual(data["state"], "partial")
         self.assertIsNone(data["core"])
         self.assertTrue(data["health"])
@@ -137,6 +137,26 @@ class CollectorTests(unittest.TestCase):
     @patch("sitewatch.collector.run", side_effect=collector.CheckFailed("TLS failure"))
     def test_failed_origin_not_healthy(self, _):
         self.assertFalse(collector.origin_health("example.org", "127.0.0.1", "/")["ok"])
+
+    def test_critical_error_needs_wordpress_error_page(self):
+        english = '<body id="error-page"><div class="wp-die-message"><p>There has been a critical error on this website.</p>'
+        lithuanian = '<body id="error-page"><div class="wp-die-message"><p>Tinklalapyje įvyko kritinė klaida.</p>'
+        self.assertTrue(collector.critical_error_page(english))
+        self.assertTrue(collector.critical_error_page(lithuanian))
+        for page in ('<body class="post"><p>How we fixed a critical error on this website.</p>',
+                     '<body><p>There has been a critical error on this website.</p>',
+                     '<body id="error-page"><p>Database connection failed.</p>'):
+            with self.subTest(page=page):
+                self.assertFalse(collector.critical_error_page(page))
+
+    def test_origin_ip_required(self):
+        site = {"id": "example.org", "kind": "web"}
+        with self.assertRaises(ValueError):
+            collector.validate_config({"sites": [dict(site)]})
+        with self.assertRaises(ValueError):
+            collector.validate_config({"origin_ip": "not-an-ip", "sites": [dict(site)]})
+        config = collector.validate_config({"origin_ip": "203.0.113.10", "sites": [dict(site), {**site, "id": "b.example.org", "origin_ip": "198.51.100.7"}]})
+        self.assertEqual([s["origin_ip"] for s in config["sites"]], ["203.0.113.10", "198.51.100.7"])
 
 
 class ViewerTests(unittest.TestCase):

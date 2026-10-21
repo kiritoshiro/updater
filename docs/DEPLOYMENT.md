@@ -14,7 +14,7 @@ sudo install -d -o root -g sitewatch -m 0750 /var/lib/site-watch
 sudo install -o root -g root -m 0600 config/collector.example.json /etc/site-watch/collector.json
 ```
 
-Edit `/etc/site-watch/collector.json` as root. Set all five WordPress domains with their verified Unix owners and absolute document roots. Add non-WordPress sites with `kind: web`. Set the actual origin listen IP: `127.0.0.1` works only if nginx listens there; otherwise use the server's own public IP. Origin checks run **on the server** with SNI and certificate verification, using `curl --resolve`, no proxy, no redirect following, and no Cloudflare cache.
+Edit `/etc/site-watch/collector.json` as root. Set all five WordPress domains with their verified Unix owners and absolute document roots. Add non-WordPress sites with `kind: web`. Set `origin_ip` (top level, or per site to override) to the address nginx listens on for HTTPS; check with `ss -ltn 'sport = :443'`. It is required and has no default: `127.0.0.1` works only if nginx listens there. Origin checks run **on the server** with SNI and certificate verification, using `curl --resolve`, no proxy, no redirect following, and no Cloudflare cache.
 
 GitHub mapping keys are `plugin:<installed-slug>` and `theme:<installed-slug>`; values are public `owner/repository` identifiers. Private repositories/tokens are not supported yet. Optional `backup_directory` reports only the newest local file's time and size; it does not verify the archive or inspect remote Drive backups.
 

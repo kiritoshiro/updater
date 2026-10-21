@@ -12,7 +12,7 @@ The collector writes schema version 1 to `/var/lib/site-watch/status.json`. The 
 - `server`: id, hostname, PHP version, disk byte counts, memory byte counts, 1/5/15-minute load, failed systemd unit names and fixed error messages.
 - `sites`: unique domain IDs. Each has `kind` (`wordpress`/`web`), `state` (`ok`/`partial`/`unhealthy`/`unreachable`), core, plugins, themes, named boolean flags, origin health, backup metadata, notes and fixed errors.
 - Component: name, installed version, reported update version or null, activation status, source and check state. GitHub items also have a public repository identifier.
-- Health: request path, HTTP status or null, response milliseconds or null, `ok` boolean; optional critical-error detection/error message.
+- Health: request path, HTTP status or null, response milliseconds or null, `ok` boolean; optional critical-error detection (WordPress's `wp_die()` fatal-error page with its English or Lithuanian message, not the words anywhere on a page)/error message.
 - Backup: `not_configured`, `unknown`, or `observed` with modification time and byte size. `verified` is always false in this milestone.
 
 The viewer rejects unsupported schemas, invalid timestamps, duplicate site IDs and oversized input. Older-than-two-hours and far-future snapshots are visibly stale. A failed refresh preserves the last successful snapshot and displays the failure alongside it. The 60-second browser poll rereads cached state for freshness; the explicit refresh button fetches the file/SSH source again.
