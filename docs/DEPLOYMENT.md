@@ -54,3 +54,31 @@ sudo journalctl -u site-collect.service
 The collector is sequential with bounded individual commands. Unlike the future 5-minute security watcher, it is not designed for a 60-second fleet-wide budget. The service has a 30-minute upper limit and locks prevent overlap. A stale snapshot warning appears after two hours; it is not an external outage alert.
 
 To stop collection, disable `site-collect.timer`; the existing status file remains. No WordPress plugin or sudoers change is installed by this milestone.
+
+# Alert watcher deployment (Part A, step 1)
+
+The watcher is described in `docs/WATCHER.md`. It reuses `/etc/site-watch/collector.json` (sites, owners, paths, `origin_ip`, `ca_file`) and adds its own root-only settings. Install the collector first.
+
+1. Create a Discord webhook (Server settings → Integrations → Webhooks) for a channel whose notifications reach your phone. The URL is a secret: anyone holding it can post to that channel.
+2. Install the settings, wrapper and units (as root):
+
+```sh
+sudo install -o root -g root -m 0600 config/watch.example.json /etc/site-watch/watch.json   # then set webhook_url
+sudo install -o root -g root -m 0700 deploy/site-watch /usr/local/sbin/site-watch
+sudo install -o root -g root -m 0644 deploy/site-watch.service deploy/site-watch.timer /etc/systemd/system/
+sudo systemctl daemon-reload
+```
+
+3. Check delivery, read a dry run, then record the baseline and start the timer:
+
+```sh
+sudo site-watch test-alert
+sudo site-watch run --dry-run      # prints what would be sent; saves nothing
+sudo site-watch baseline           # records the current state without alerting
+sudo systemctl enable --now site-watch.timer
+sudo site-watch status
+```
+
+State lives in `/var/lib/site-watch/watch/` (root 0700; created on first run), separate from the dashboard's group-readable `status.json`. Before a planned plugin update or deploy, `sudo site-watch quiet <site> 30` turns WARNINGs into INFO for 30 minutes; a new plugin or must-use plugin still alerts. After an expected change, `sudo site-watch rebaseline <site>` accepts it.
+
+To stop alerts, disable `site-watch.timer`. To remove the watcher completely: disable the timer, delete the two units, `/usr/local/sbin/site-watch`, `/etc/site-watch/watch.json` and `/var/lib/site-watch/watch/`.

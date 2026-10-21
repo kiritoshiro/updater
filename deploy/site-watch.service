@@ -1,0 +1,23 @@
+[Unit]
+Description=WP Site Watch alert watcher (file changes, origin health)
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=oneshot
+User=root
+Group=root
+ExecStart=/usr/bin/python3 -m sitewatch.watcher run
+WorkingDirectory=/opt/site-watch
+Environment=PYTHONPATH=/opt/site-watch
+UMask=0077
+TimeoutStartSec=4min
+Nice=5
+PrivateTmp=true
+ProtectSystem=full
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+# Unlike the collector, the watcher never switches user, so it can drop privilege escalation.
+NoNewPrivileges=true
+# Do not use ProtectHome: site roots live under /home.

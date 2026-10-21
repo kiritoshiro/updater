@@ -2,7 +2,7 @@
 
 A local dashboard for your WordPress sites and Linux server. A server collector writes a small JSON snapshot; the Windows/Linux viewer reads it over SSH. No remote-control plugin is installed on your sites.
 
-**v0.1 is the first read-only milestone.** It includes a working demo, collector, SSH transport and dashboard. Production deployment and automatic updates have not been performed. The updater, rollback engine and alerting watcher remain on the roadmap.
+**v0.1 is the first read-only milestone.** It includes a working demo, collector, SSH transport and dashboard. The read-only collector is deployed on the first server. The alert watcher (Part A, step 1: file-level changes and origin health, alerts to Discord) is in development; see `docs/WATCHER.md`. The updater and rollback engine remain on the roadmap.
 
 ## Try it
 
