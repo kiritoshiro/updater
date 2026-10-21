@@ -1,0 +1,5 @@
+{
+  "host": "your-server",
+  "user": "your-user",
+  "port": 22
+}

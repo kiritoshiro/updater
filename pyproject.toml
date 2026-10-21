@@ -1,0 +1,20 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "wp-site-watch"
+version = "0.1.0"
+description = "SSH-based WordPress fleet inventory and local dashboard"
+requires-python = ">=3.11"
+dependencies = []
+
+[project.scripts]
+site-watch = "sitewatch.__main__:main"
+site-collect = "sitewatch.collector:main"
+
+[tool.setuptools.package-data]
+sitewatch = ["web/*"]
+
+[tool.setuptools.packages.find]
+include = ["sitewatch*"]
