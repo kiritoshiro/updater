@@ -1,0 +1,21 @@
+[Unit]
+Description=Collect WP Site Watch read-only inventory
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=oneshot
+User=root
+Group=root
+ExecStart=/usr/bin/python3 -m sitewatch.collector --config /etc/site-watch/collector.json
+WorkingDirectory=/opt/site-watch
+Environment=PYTHONPATH=/opt/site-watch
+UMask=0027
+TimeoutStartSec=30min
+PrivateTmp=true
+ProtectSystem=full
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+# Do not set NoNewPrivileges: the collector must sudo to non-root site owners.
+# Do not use ProtectHome: site roots live under /home.

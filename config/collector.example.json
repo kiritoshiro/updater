@@ -1,0 +1,22 @@
+{
+  "server_id": "primary-server",
+  "origin_ip": "127.0.0.1",
+  "sites": [
+    {
+      "id": "example.org",
+      "kind": "wordpress",
+      "owner": "example",
+      "path": "/home/example/public_html",
+      "health_paths": ["/", "/wp-login.php", "/category/news/"],
+      "github": {
+        "theme:example-theme": "your-account/your-theme",
+        "plugin:example-plugin": "your-account/your-plugin"
+      }
+    },
+    {
+      "id": "app.example.org",
+      "kind": "web",
+      "health_paths": ["/"]
+    }
+  ]
+}
