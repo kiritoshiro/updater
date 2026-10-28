@@ -82,26 +82,64 @@ const RESULT_BADGES = {updated: ['Updated', 'good'], unchanged: ['No change', 'n
 function canUpdate(item) { return !!payload?.capabilities?.updates && ['plugin', 'theme', 'core'].includes(item.type); }
 function itemLabel(r) { return r.kind === 'core' ? 'WordPress core' : r.kind === 'translations' ? 'Translations' : r.slug; }
 function showBanner(text, error) { $('banner').textContent = text; $('banner').hidden = false; $('banner').classList.toggle('error', error); $('banner').scrollIntoView({block: 'nearest', behavior: 'smooth'}); }
+const selected = new Set();
+const key = (site, item) => `${site.id}|${item.type}|${item.name}`;
+const label = item => item.type === 'core' ? 'WordPress core' : item.name;
+async function postUpdate(site, item, restoreDatabase) {
+  // One update; returns its result (or {result:'failed', message}) and re-renders with the reply.
+  try {
+    const response = await fetch('/api/update', {method: 'POST', headers: {'Content-Type': 'application/json', 'X-Site-Watch-Token': payload.refresh_token},
+      body: JSON.stringify({site: site.id, kind: item.type, slug: item.type === 'core' ? null : item.name, restore_database: item.type === 'core' ? true : restoreDatabase})});
+    const data = await response.json();
+    if ('status' in data) render(data);
+    return data.results?.[data.results.length - 1] || {result: 'failed', message: data.error || 'The update request failed'};
+  } catch (_) {
+    return {result: 'failed', message: 'The update request failed. Check the update log before trying again'};
+  }
+}
+const ok = r => ['updated', 'unchanged'].includes(r.result);
 async function runUpdate(site, item) {
-  const what = item.type === 'core' ? 'WordPress core' : item.name;
   // Core always restores the database: update-db upgrades it, and old core files on it are no rollback.
-  const answer = await ask({title: `Update ${what} on ${site.id}?`, ok: 'Update', option: item.type !== 'core',
+  const answer = await ask({title: `Update ${label(item)} on ${site.id}?`, ok: 'Update', option: item.type !== 'core',
     text: `${item.version || '?'} → ${item.update_version}. A backup of its files and the database is taken first. If the site fails its health check afterwards, the backup is restored automatically.`});
   if (!answer) return;
   updating = true; renderUpdates();
-  showBanner(`Updating ${what} on ${site.id}. This can take a few minutes; keep this page open.`, false);
-  try {
-    const response = await fetch('/api/update', {method: 'POST', headers: {'Content-Type': 'application/json', 'X-Site-Watch-Token': payload.refresh_token},
-      body: JSON.stringify({site: site.id, kind: item.type, slug: item.type === 'core' ? null : item.name, restore_database: answer.restoreDatabase})});
-    const data = await response.json();
-    if ('status' in data) render(data);
-    const r = data.results?.[data.results.length - 1];
-    showBanner(r ? `${site.id} · ${what}: ${r.message}.${r.result === 'updated' ? ' The inventory refreshes within a minute.' : ''}` : data.error || 'The update request failed.', !r || !['updated', 'unchanged'].includes(r.result));
-  } catch (_) {
-    showBanner('The update request failed. Check the update log before trying again.', true);
-  } finally {
-    updating = false; renderUpdates(); setTimeout(() => load(true), 60000);
+  showBanner(`Updating ${label(item)} on ${site.id}. This can take a few minutes; keep this page open.`, false);
+  const r = await postUpdate(site, item, answer.restoreDatabase);
+  selected.delete(key(site, item));
+  updating = false; renderUpdates();
+  showBanner(`${site.id} · ${label(item)}: ${r.message}.${r.result === 'updated' ? ' The inventory refreshes within a minute.' : ''}`, !ok(r));
+  setTimeout(() => load(true), 60000);
+}
+function selectedItems() {
+  return grouped().flatMap(([, , entries]) => entries).filter(({site, item}) => selected.has(key(site, item)));
+}
+async function runSelected() {
+  const chosen = selectedItems();
+  if (!chosen.length) return;
+  const sites = new Set(chosen.map(({site}) => site.id));
+  const answer = await ask({title: `Update ${chosen.length} item${chosen.length > 1 ? 's' : ''} on ${sites.size} site${sites.size > 1 ? 's' : ''}?`, ok: 'Update all',
+    option: chosen.some(({item}) => item.type !== 'core'),
+    text: 'They run one after another, each with its own backup, health check and automatic rollback. If one fails on a site, the rest of that site’s selection is skipped; other sites continue. Keep this page open.'});
+  if (!answer) return;
+  updating = true; renderUpdates();
+  const done = [], failed = new Set();
+  for (const [index, {site, item}] of chosen.entries()) {
+    if (failed.has(site.id)) { done.push({site, item, r: {result: 'skipped'}}); continue; }
+    showBanner(`Updating ${index + 1} of ${chosen.length}: ${label(item)} on ${site.id}…`, false);
+    const r = await postUpdate(site, item, answer.restoreDatabase);
+    selected.delete(key(site, item));
+    if (!ok(r)) failed.add(site.id);
+    done.push({site, item, r});
   }
+  updating = false; renderUpdates();
+  const count = name => done.filter(d => d.r.result === name).length;
+  const problems = done.filter(d => !ok(d.r) && d.r.result !== 'skipped').map(d => `${label(d.item)} on ${d.site.id}: ${d.r.message}`);
+  const summary = [`${count('updated')} updated`, count('unchanged') && `${count('unchanged')} unchanged`, count('rolled_back') && `${count('rolled_back')} rolled back`,
+    count('rollback_failed') && `${count('rollback_failed')} ROLLBACK FAILED`, count('refused') && `${count('refused')} refused`, count('failed') && `${count('failed')} failed`,
+    count('skipped') && `${count('skipped')} skipped`].filter(Boolean).join(', ');
+  showBanner(`${summary}.${problems.length ? ' ' + problems.join(' · ') + '.' : ''} The inventory refreshes within a minute.`, !!problems.length);
+  setTimeout(() => load(true), 60000);
 }
 function ask({title, text, ok, option = false}) {
   // One dialog for confirmations; resolves to null (cancel) or {restoreDatabase}.
@@ -156,24 +194,61 @@ function renderHistory() {
   }
   if (!history.length) list.append(node('p', 'No updates have been run from Site Watch yet.', 'detail-note'));
 }
+const GROUPS = [['core', 'WordPress core'], ['plugin', 'Plugins'], ['theme', 'Themes']];
+function grouped() {
+  return GROUPS.map(([type, title]) => [type, title, (snapshot?.sites || []).flatMap(site => updates(site).filter(item => item.type === type).map(item => ({site, item})))]);
+}
+function checkbox(checked, labelText, onChange) {
+  const box = node('input'); box.type = 'checkbox'; box.checked = checked; box.disabled = updating || !!payload?.update_running;
+  box.setAttribute('aria-label', labelText); box.addEventListener('change', () => onChange(box.checked)); return box;
+}
 function renderUpdates() {
   const list = $('update-list'); list.replaceChildren();
-  for (const site of snapshot?.sites || []) for (const item of updates(site)) {
-    const row = node('div', undefined, 'update-item'), name = node('div', item.name), side = node('div', undefined, 'update-actions');
-    name.append(node('small', `${site.id} · ${item.type} · ${item.source || 'wordpress.org'}`));
-    side.append(node('span', `${item.version || '?'} → ${item.update_version}`, 'version-change'));
-    if (canUpdate(item)) {
-      const button = node('button', 'Update', 'filter update-button'); button.disabled = updating || !!payload.update_running;
-      button.setAttribute('aria-label', `Update ${item.name} on ${site.id}`); button.addEventListener('click', () => runUpdate(site, item)); side.append(button);
+  const enabled = !!payload?.capabilities?.updates, busy = updating || !!payload?.update_running;
+  for (const [type, title, entries] of grouped()) {
+    if (!entries.length) continue;
+    const head = node('div', undefined, 'update-group-head'), heading = node('h3', `${title} `);
+    heading.append(node('span', String(entries.length), 'count'));
+    if (enabled) {
+      const all = entries.every(({site, item}) => selected.has(key(site, item)));
+      const box = checkbox(all, `Select all ${title.toLowerCase()}`, on => { for (const {site, item} of entries) on ? selected.add(key(site, item)) : selected.delete(key(site, item)); renderUpdates(); });
+      const pick = node('label', undefined, 'select-all'); pick.append(box, node('span', 'Select all')); head.append(heading, pick);
+    } else head.append(heading);
+    list.append(head);
+    for (const {site, item} of entries) {
+      const row = node('div', undefined, 'update-item'), name = node('div', undefined, 'update-name'), side = node('div', undefined, 'update-actions');
+      if (enabled) name.append(checkbox(selected.has(key(site, item)), `Select ${label(item)} on ${site.id}`, on => { on ? selected.add(key(site, item)) : selected.delete(key(site, item)); renderSelection(); }));
+      const text = node('div', label(item)); text.append(node('small', `${site.id} · ${item.source || 'wordpress.org'}`)); name.append(text);
+      side.append(node('span', `${item.version || '?'} → ${item.update_version}`, 'version-change'));
+      if (canUpdate(item)) {
+        const button = node('button', 'Update', 'filter update-button'); button.disabled = busy;
+        button.setAttribute('aria-label', `Update ${label(item)} on ${site.id}`); button.addEventListener('click', () => runUpdate(site, item)); side.append(button);
+      }
+      row.append(name, side); list.append(row);
     }
-    row.append(name, side); list.append(row);
   }
-  for (const item of serverUpdates(snapshot?.server)) {
-    const row = node('div', undefined, 'update-item'), name = node('div', item.name);
-    name.append(node('small', `${snapshot.server.hostname || 'server'} · ${item.type} · ${item.source}`));
-    row.append(name, node('span', `${item.version || '?'} → ${item.update_version}`, 'version-change')); list.append(row);
+  const server = serverUpdates(snapshot?.server);
+  if (server.length) {
+    const head = node('div', undefined, 'update-group-head'), heading = node('h3', 'Server packages ');
+    heading.append(node('span', String(server.length), 'count')); head.append(heading, node('span', 'Installed by Ubuntu, not from here', 'detail-note')); list.append(head);
+    for (const item of server) {
+      const row = node('div', undefined, 'update-item'), name = node('div', item.name);
+      name.append(node('small', `${snapshot.server.hostname || 'server'} · ${item.type} · ${item.source}`));
+      row.append(name, node('span', `${item.version || '?'} → ${item.update_version}`, 'version-change')); list.append(row);
+    }
   }
   if (!list.children.length) list.append(node('p', 'No updates reported in this snapshot. Unavailable or unmapped vendor checks may still need attention.', 'detail-note'));
+  // Forget selections whose update is no longer reported.
+  const present = new Set(grouped().flatMap(([, , entries]) => entries.map(({site, item}) => key(site, item))));
+  for (const k of [...selected]) if (!present.has(k)) selected.delete(k);
+  renderSelection();
+}
+function renderSelection() {
+  const bar = $('selection-bar'), enabled = !!payload?.capabilities?.updates;
+  bar.hidden = !enabled;
+  $('selection-count').textContent = selected.size ? `${selected.size} selected` : 'Select updates to run several in one go';
+  $('run-selected').disabled = !selected.size || updating || !!payload?.update_running;
+  $('clear-selected').disabled = !selected.size || updating;
 }
 function showDetail(site) {
   $('detail-title').textContent = site.id; const body = $('detail-body'); body.replaceChildren();
@@ -232,5 +307,7 @@ $('search').addEventListener('input', e => {query = e.target.value.toLowerCase()
 document.querySelectorAll('[data-filter]').forEach(button => button.addEventListener('click', () => {filter = button.dataset.filter; document.querySelectorAll('[data-filter]').forEach(b => b.classList.toggle('selected', b === button)); renderSites();}));
 document.querySelectorAll('[data-view]').forEach(button => button.addEventListener('click', () => {currentView = button.dataset.view; for (const id of ['overview','updates','server']) $(`${id}-view`).hidden = id !== currentView; document.querySelectorAll('[data-view]').forEach(b => b.classList.toggle('active', b === button)); $('breadcrumb').textContent = {overview:'Overview',updates:'Updates',server:'Server health'}[currentView]; $('page-title').textContent = {overview:'A clear view of your sites.',updates:'Know what needs updating.',server:'Keep an eye on your server.'}[currentView];}));
 $('close-detail').addEventListener('click', () => $('detail').close());
+$('run-selected').addEventListener('click', runSelected);
+$('clear-selected').addEventListener('click', () => { selected.clear(); renderUpdates(); });
 load();
 setInterval(() => load(), 60000);

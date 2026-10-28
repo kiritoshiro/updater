@@ -34,7 +34,9 @@
         </section>
         <section class="bottom-grid"><article class="panel server-summary"><div class="panel-head"><div><p class="eyebrow">INFRASTRUCTURE</p><h2 id="server-name">Server health</h2></div><span class="badge neutral">Linux server</span></div><div id="server-compact"></div></article><article class="panel next-panel"><span class="next-icon">↗</span><p class="eyebrow">CONTROLLED UPDATES</p><h2>Backup, check, roll back.</h2><p>Each update backs up the files and database, checks the site at its origin afterwards and restores the backup automatically if the check fails.</p><div class="next-note" id="update-note">Read only.</div></article></section>
       </div>
-      <section id="updates-view" class="panel" hidden><div class="panel-head"><div><h2>Available updates</h2><p>Review reported versions before planning a maintenance window.</p></div><span class="badge neutral" id="update-mode">Read only</span></div><div id="update-list" class="update-list"></div>
+      <section id="updates-view" class="panel" hidden><div class="panel-head"><div><h2>Available updates</h2><p>Review reported versions before planning a maintenance window.</p></div><span class="badge neutral" id="update-mode">Read only</span></div>
+        <div id="selection-bar" class="selection-bar" hidden><span id="selection-count"></span><span class="selection-actions"><button id="clear-selected" class="filter">Clear</button><button id="run-selected" class="primary">Update selected</button></span></div>
+        <div id="update-list" class="update-list"></div>
         <div id="history-panel" hidden><div class="panel-head"><div><h2>Recent updates</h2><p>From the server's update log, newest first.</p></div></div><div id="update-history" class="update-list"></div></div></section>
       <section id="server-view" class="panel" hidden><div class="panel-head"><div><h2>Server health</h2><p>Operating-system readings from the collector.</p></div></div><div id="server-details" class="server-details"></div></section>
       <footer><span>WP Site Watch</span><span>Local dashboard · No tracking · No remote-control plugin</span></footer>
