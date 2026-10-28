@@ -12,7 +12,7 @@
     <button class="nav active" data-view="overview"><span>◫</span> Overview</button>
     <button class="nav" data-view="updates"><span>↗</span> Updates <span id="nav-count" class="nav-count">—</span></button>
     <button class="nav" data-view="server"><span>▤</span> Server health</button>
-    <div class="sidebar-bottom"><span class="shield">◇</span><strong>Connected through SSH</strong><p>Inventory stays outside WordPress. Your sites need no extra plugin.</p><span class="version">VERSION 0.1 · READ ONLY</span></div>
+    <div class="sidebar-bottom"><span class="shield">◇</span><strong>Connected through SSH</strong><p>Inventory stays outside WordPress. Your sites need no extra plugin.</p><span class="version" id="version-mode">VERSION 0.2 · READ ONLY</span></div>
   </aside>
   <main>
     <header class="topbar"><span class="breadcrumb">Workspace <span>/</span> <strong id="breadcrumb">Overview</strong></span><span class="connection" id="connection">Loading snapshot</span></header>
@@ -29,16 +29,22 @@
       <div id="overview-view">
         <section class="panel fleet-panel"><div class="panel-head"><div><h2>Your sites <span id="table-count" class="count">0</span></h2><p>Open a site to inspect its versions and checks.</p></div><label class="search"><span>⌕</span><input id="search" type="search" placeholder="Find a site…" aria-label="Find a site"></label></div>
           <div class="filters" role="group" aria-label="Filter sites"><button class="filter selected" data-filter="all">All sites</button><button class="filter" data-filter="updates">Updates available</button><button class="filter" data-filter="attention">Needs attention</button><span class="table-hint">LATEST COLLECTOR SNAPSHOT</span></div>
-          <div class="table-scroll"><table><thead><tr><th>WEBSITE</th><th>ORIGIN</th><th>WORDPRESS</th><th>UPDATES</th><th>FILE MODIFICATIONS</th><th></th></tr></thead><tbody id="sites"><tr><td colspan="6" class="empty">Loading your workspace…</td></tr></tbody></table></div>
-          <div class="panel-foot"><span id="table-foot">Read-only inventory</span><span>Updates are never installed automatically</span></div>
+          <div class="table-scroll"><table><thead><tr><th>WEBSITE</th><th>ORIGIN</th><th>WORDPRESS</th><th>UPDATES</th><th>FILE MODIFICATIONS</th><th>NIGHTLY</th><th></th></tr></thead><tbody id="sites"><tr><td colspan="7" class="empty">Loading your workspace…</td></tr></tbody></table></div>
+          <div class="panel-foot"><span id="table-foot">Read-only inventory</span><span>Updates run when you press Update, or nightly where switched on</span></div>
         </section>
-        <section class="bottom-grid"><article class="panel server-summary"><div class="panel-head"><div><p class="eyebrow">INFRASTRUCTURE</p><h2 id="server-name">Server health</h2></div><span class="badge neutral">Linux server</span></div><div id="server-compact"></div></article><article class="panel next-panel"><span class="next-icon">↗</span><p class="eyebrow">CONTROLLED UPDATES</p><h2>Visibility first. Updates next.</h2><p>Update execution is being built around backups, origin health checks and automatic rollback.</p><div class="next-note">Available in a later release after disposable-site testing.</div></article></section>
+        <section class="bottom-grid"><article class="panel server-summary"><div class="panel-head"><div><p class="eyebrow">INFRASTRUCTURE</p><h2 id="server-name">Server health</h2></div><span class="badge neutral">Linux server</span></div><div id="server-compact"></div></article><article class="panel next-panel"><span class="next-icon">↗</span><p class="eyebrow">CONTROLLED UPDATES</p><h2>Backup, check, roll back.</h2><p>Each update backs up the files and database, checks the site at its origin afterwards and restores the backup automatically if the check fails.</p><div class="next-note" id="update-note">Read only.</div></article></section>
       </div>
-      <section id="updates-view" class="panel" hidden><div class="panel-head"><div><h2>Available updates</h2><p>Review reported versions before planning a maintenance window.</p></div><span class="badge neutral">Execution unavailable</span></div><div id="update-list" class="update-list"></div></section>
+      <section id="updates-view" class="panel" hidden><div class="panel-head"><div><h2>Available updates</h2><p>Review reported versions before planning a maintenance window.</p></div><span class="badge neutral" id="update-mode">Read only</span></div>
+        <div id="selection-bar" class="selection-bar" hidden><span id="selection-count"></span><span class="selection-actions"><button id="clear-selected" class="filter">Clear</button><button id="run-selected" class="primary">Update selected</button></span></div>
+        <div id="update-list" class="update-list"></div>
+        <div id="history-panel" hidden><div class="panel-head"><div><h2>Recent updates</h2><p>From the server's update log, newest first.</p></div></div><div id="update-history" class="update-list"></div></div></section>
       <section id="server-view" class="panel" hidden><div class="panel-head"><div><h2>Server health</h2><p>Operating-system readings from the collector.</p></div></div><div id="server-details" class="server-details"></div></section>
       <footer><span>WP Site Watch</span><span>Local dashboard · No tracking · No remote-control plugin</span></footer>
     </div>
   </main>
+  <dialog id="confirm" class="confirm-dialog" aria-labelledby="confirm-title"><p class="eyebrow">PLEASE CONFIRM</p><h2 id="confirm-title"></h2><p id="confirm-text" class="detail-note"></p><ul id="confirm-list" class="confirm-list" hidden></ul>
+    <label id="confirm-option" class="confirm-option"><input type="checkbox" id="confirm-restore-db" checked> <span>If the update fails, also restore the database.<small>Leave this on unless the site takes orders or form entries you cannot lose: anything saved during the update (usually a minute or two) is then undone. Off restores only the files; the database backup is still kept.</small></span></label>
+    <div class="confirm-actions"><button id="confirm-cancel" class="filter">Cancel</button><button id="confirm-ok" class="primary">Update</button></div></dialog>
   <dialog id="detail"><div class="detail-header"><div><p class="eyebrow">SITE INVENTORY</p><h2 id="detail-title"></h2></div><button id="close-detail" aria-label="Close site details">✕</button></div><div id="detail-body"></div></dialog>
 </body>
 </html>

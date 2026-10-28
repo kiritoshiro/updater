@@ -1,0 +1,5 @@
+#!/bin/sh
+# Root-only entry point for validated updates (see docs/UPDATER.md); the one command the dashboard
+# user may run with sudo. -I ignores PYTHON* variables and user site-packages, so only the
+# root-owned code in /opt/site-watch is imported.
+cd / && exec /usr/bin/python3 -I -c 'import sys; sys.path.insert(0, "/opt/site-watch"); from sitewatch.updater import main; sys.exit(main(sys.argv[1:]))' "$@"

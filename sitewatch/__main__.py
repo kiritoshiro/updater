@@ -4,7 +4,7 @@ from pathlib import Path
 import webbrowser
 
 from .demo import sample
-from .transport import fetch_file, fetch_ssh, ssh_command
+from .transport import SshUpdates, fetch_file, fetch_ssh, ssh_command
 from .viewer import State, make_server
 
 
@@ -17,6 +17,7 @@ def main():
     parser.add_argument("--port", type=int, default=8765)
     parser.add_argument("--no-browser", action="store_true")
     args = parser.parse_args()
+    updates = None
     try:
         if args.demo:
             loader, label = sample, "Demo · sample data"
@@ -26,7 +27,10 @@ def main():
             config = json.loads(args.config.read_text(encoding="utf-8"))
             ssh_command(config)
             loader, label = lambda: fetch_ssh(config), "SSH · read only"
-        state = State(loader, label)
+            if config.get("updates") is True:
+                updates = SshUpdates(config)
+                label = "SSH · updates enabled"
+        state = State(loader, label, updates)
         state.refresh()
         server = make_server(state, args.port)
     except (ValueError, OSError) as exc:

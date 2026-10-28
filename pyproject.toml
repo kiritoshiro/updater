@@ -4,8 +4,8 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "wp-site-watch"
-version = "0.1.0"
-description = "SSH-based WordPress fleet inventory and local dashboard"
+version = "0.2.0"
+description = "SSH-based WordPress fleet inventory, local dashboard and validated updates"
 requires-python = ">=3.11"
 dependencies = []
 

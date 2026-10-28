@@ -53,4 +53,35 @@ sudo journalctl -u site-collect.service
 
 The collector is sequential with bounded individual commands. Unlike the future 5-minute security watcher, it is not designed for a 60-second fleet-wide budget. The service has a 30-minute upper limit and locks prevent overlap. A stale snapshot warning appears after two hours; it is not an external outage alert.
 
-To stop collection, disable `site-collect.timer`; the existing status file remains. No WordPress plugin or sudoers change is installed by this milestone.
+To stop collection, disable `site-collect.timer`; the existing status file remains. The collector installs no WordPress plugin and needs no sudoers change.
+
+# Updater deployment (Phase 4)
+
+`site-update` is described in `docs/UPDATER.md`. It reuses the collector's code, configuration and `status.json`; install and run the collector first. Prove it on a disposable WordPress (`tests/disposable/README.md`) with the exact code you install.
+
+Server needs: `mysqldump`/`mysql` clients for `wp db export`/`import` (installed with MariaDB/MySQL), `tar`, and outbound HTTPS to `api.github.com`, `github.com` and `*.githubusercontent.com` for GitHub-mapped plugins and themes. Backups need free space for one database dump plus the component; the wrapper refuses below 2 GB free.
+
+1. Copy the reviewed code to `/opt/site-watch/sitewatch/` as for the collector (root-owned, not writable by others).
+2. Install the wrapper, the one sudoers rule (replace `darius` with the dashboard's SSH user) and the backup folder:
+
+```sh
+sudo install -o root -g root -m 0755 deploy/site-update /usr/local/sbin/site-update
+sudo install -o root -g root -m 0440 deploy/site-update.sudoers /etc/sudoers.d/site-update
+sudo visudo -cf /etc/sudoers.d/site-update
+sudo install -d -o root -g root -m 0700 /var/backups/site-update
+sudo install -o root -g root -m 0644 deploy/site-update-nightly.service deploy/site-update-nightly.timer /etc/systemd/system/
+sudo systemctl daemon-reload
+sudo systemctl enable --now site-update-nightly.timer   # does nothing until a site's nightly switch is on
+```
+
+3. Optional: add an archive page to each site's `health_paths` in `/etc/site-watch/collector.json`, e.g. `"health_paths": ["/", "/wp-login.php", "/category/naujienos/"]`.
+4. Check from the dashboard user's SSH session, without changing anything:
+
+```sh
+sudo -n /usr/local/sbin/site-update example.org plugin no-such-plugin   # refused, exit 2
+sudo -n /usr/bin/id                                                   # must fail: only site-update is allowed
+```
+
+5. Run a first real update by hand on one site, on a plugin you can live without for a minute, and read the result and `/var/lib/site-watch/update-log.jsonl`. Then set `"updates": true` in the viewer's `config.local.json`.
+
+To remove it: `sudo systemctl disable --now site-update-nightly.timer`, then `sudo rm /etc/sudoers.d/site-update /usr/local/sbin/site-update /etc/systemd/system/site-update-nightly.*`. The update log and backups stay until deleted; backups are pruned only by `site-update` itself.

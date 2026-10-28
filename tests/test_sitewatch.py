@@ -94,8 +94,74 @@ class TransportTests(unittest.TestCase):
             fetch_ssh({"host": "example.org", "user": "darius"})
         self.assertNotIn("secret", str(error.exception))
 
+    def test_update_command_is_fixed_and_validated(self):
+        config = {"host": "example.org", "user": "darius", "port": 5567}
+        self.assertEqual(transport.update_command(config, "example.org", "plugin", "classic-editor")[-1],
+                         "sudo -n /usr/local/sbin/site-update --json example.org plugin classic-editor")
+        self.assertEqual(transport.update_command(config, "example.org", "core")[-1],
+                         "sudo -n /usr/local/sbin/site-update --json example.org core")
+        for args in (("example.org", "plugin", "x;id"), ("example.org", "plugin", "$(id)"), ("example.org", "plugin", "-x"),
+                     ("example.org", "plugin", None), ("example.org", "core", "x"), ("example.org", "all", None),
+                     ("a b", "core", None), ("example.org;id", "core", None)):
+            with self.subTest(args=args), self.assertRaises(ValueError):
+                transport.update_command(config, *args)
+
+    @patch("sitewatch.transport.subprocess.run")
+    def test_update_reply_is_cleaned(self, run):
+        config = {"host": "example.org", "user": "darius"}
+        reply = {"results": [{"site": "example.org", "kind": "plugin", "slug": "x", "result": "rolled_back",
+                              "message": "m" * 1000, "backup": "/var/backups/x", "extra": "<script>"}]}
+        run.return_value = subprocess.CompletedProcess([], 3, ("Waiting…\n" + json.dumps(reply)).encode(), b"")
+        [result] = transport.run_update(config, "example.org", "plugin", "x")
+        self.assertEqual((result["result"], len(result["message"])), ("rolled_back", 300))
+        self.assertNotIn("extra", result)
+        run.return_value = subprocess.CompletedProcess([], 1, b"", b"sudo: a password is required")
+        with self.assertRaises(ValueError) as error:
+            transport.run_update(config, "example.org", "plugin", "x")
+        self.assertIn("sudoers", str(error.exception))
+        run.return_value = subprocess.CompletedProcess([], 1, b'{"error": "Another update is still running; try again later"}', b"")
+        with self.assertRaises(ValueError):
+            transport.run_update(config, "example.org", "plugin", "x")
+        state = (b'{"result": "updated"}\nnot json\n{"result": "bad"}\n' + transport.NIGHTLY_MARK.encode()
+                 + b'\n{"sites": {"example.org": {"enabled": true, "by": "darius"}, "bad site": {"enabled": true},'
+                 + b' "other.org": {"enabled": "yes"}}}\n')
+        run.return_value = subprocess.CompletedProcess([], 0, state, b"")
+        history, nightly = transport.fetch_server_state(config)
+        self.assertEqual(len(history), 1)
+        self.assertEqual(nightly, {"example.org": {"enabled": True, "by": "darius"}})
+        run.return_value = subprocess.CompletedProcess([], 0, transport.NIGHTLY_MARK.encode() + b"\n", b"")
+        self.assertIsNone(transport.fetch_server_state(config)[1])  # unreadable switch file: unknown, not off
+        run.return_value = subprocess.CompletedProcess([], 0, transport.NIGHTLY_MARK.encode() + b"\n{}\n", b"")
+        self.assertEqual(transport.fetch_server_state(config)[1], {})
+
+    def test_rollback_choice_and_nightly_commands(self):
+        config = {"host": "example.org", "user": "darius", "port": 5567}
+        self.assertEqual(transport.update_command(config, "example.org", "plugin", "x", restore_database=False)[-1],
+                         "sudo -n /usr/local/sbin/site-update --json --files-only-rollback example.org plugin x")
+        self.assertEqual(transport.nightly_command(config, "example.org", True)[-1],
+                         "sudo -n /usr/local/sbin/site-update --json example.org nightly on")
+        for args in (("example.org", "yes"), ("example.org;id", True), ("example.org", 1)):
+            with self.subTest(args=args), self.assertRaises(ValueError):
+                transport.nightly_command(config, *args)
+        with self.assertRaises(ValueError):
+            transport.update_command(config, "example.org", "core", None, "false")
+
 
 class CollectorTests(unittest.TestCase):
+    @patch("sitewatch.collector.origin_health", return_value={"path": "/", "ok": True, "status": 200})
+    @patch("sitewatch.collector.security_flags", return_value={})
+    @patch("sitewatch.collector.wp")
+    def test_core_reports_the_installed_branch_release(self, wp, *_):
+        def answer(site, *args):
+            if args[:2] == ("core", "version"):
+                return "6.8.2"
+            if args[:2] == ("core", "check-update"):
+                return json.dumps([{"version": "7.0.1", "update_type": "major"}, {"version": "6.8.3", "update_type": "minor"}])
+            return "[]"
+        wp.side_effect = answer
+        core = collector.collect_site({"id": "example.org", "kind": "wordpress", "origin_ip": "203.0.113.10"}, {}, {})["core"]
+        self.assertEqual((core["update_version"], core["minor_update_version"]), ("7.0.1", "6.8.3"))
+
     @patch("sitewatch.collector.run", return_value="6.8.2")
     @patch("sitewatch.collector.validate_owner")
     def test_wp_always_drops_privileges(self, validate, run):
@@ -272,6 +338,22 @@ class CollectorTests(unittest.TestCase):
         self.assertEqual(info["failed_units"], ["nginx.service"])
 
 
+class FakeUpdates:
+    def __init__(self, calls):
+        self.calls = calls
+
+    def run(self, site, kind, slug, restore_database=True):
+        self.calls.append((site, kind, slug, restore_database))
+        return [{"result": "updated"}]
+
+    def server_state(self):
+        return [], {}
+
+    def set_nightly(self, site, enabled):
+        self.calls.append(("nightly", site, enabled))
+        return {"enabled": enabled, "by": "darius"}
+
+
 class ViewerTests(unittest.TestCase):
     def setUp(self):
         self.state = State(sample, "Demo")
@@ -313,9 +395,74 @@ class ViewerTests(unittest.TestCase):
         headers = {"Origin": self.origin, "X-Site-Watch-Token": self.state.token}
         self.assertEqual(self.request("POST", "/api/refresh", headers)[0], 200)
 
-    def test_no_remote_update_endpoint(self):
-        headers = {"Origin": self.origin, "X-Site-Watch-Token": self.state.token}
-        self.assertEqual(self.request("POST", "/api/update", headers)[0], 404)
+    def post_update(self, body, origin=None, path="/api/update"):
+        raw = json.dumps(body).encode()
+        connection = http.client.HTTPConnection("127.0.0.1", self.server.server_port, timeout=3)
+        connection.request("POST", path, raw, {"Origin": origin or self.origin, "X-Site-Watch-Token": self.state.token,
+                                                         "Content-Type": "application/json", "Content-Length": str(len(raw))})
+        response = connection.getresponse()
+        code, reply = response.status, json.loads(response.read())
+        connection.close()
+        return code, reply
+
+    def enable_updates(self):
+        calls = []
+        live = sample(); live["demo"] = False
+        self.state.loader = lambda: live
+        self.state.updates = FakeUpdates(calls)
+        self.state.refresh()
+        return calls
+
+    def test_read_only_dashboard_refuses_updates(self):
+        code, reply = self.post_update({"site": "adventistai.lt", "kind": "plugin", "slug": "wordfence"})
+        self.assertEqual(code, 400)
+        self.assertFalse(reply["capabilities"]["updates"])
+
+    def test_demo_data_never_offers_updates(self):
+        self.state.updates = FakeUpdates([])
+        self.assertFalse(self.state.payload()["capabilities"]["updates"])
+
+    def test_update_runs_only_reported_updates(self):
+        calls = self.enable_updates()
+        self.assertTrue(self.state.payload()["capabilities"]["updates"])
+        self.assertEqual(self.post_update({"site": "adventistai.lt", "kind": "plugin", "slug": "wordfence"})[0], 200)
+        self.assertEqual(self.post_update({"site": "dievozodis.lt", "kind": "core"})[0], 200)
+        for body in ({"site": "sveikas.info", "kind": "plugin", "slug": "wordfence"}, {"site": "adventistai.lt", "kind": "core"},
+                     {"site": "adventistai.lt", "kind": "plugin", "slug": "wordfence; id"}, {"site": "giesmynas.adventistai.lt", "kind": "core"},
+                     {"site": "adventistai.lt", "kind": "all"}, {"site": "adventistai.lt", "kind": "plugin", "slug": "wordfence", "extra": 1}):
+            with self.subTest(body=body):
+                self.assertEqual(self.post_update(body)[0], 400)
+        self.assertEqual(self.post_update({"site": "malonetau.lt", "kind": "plugin", "slug": "wordfence", "restore_database": False})[0], 200)
+        self.assertEqual(self.post_update({"site": "malonetau.lt", "kind": "plugin", "slug": "wordfence", "restore_database": "no"})[0], 400)
+        self.assertEqual(calls, [("adventistai.lt", "plugin", "wordfence", True), ("dievozodis.lt", "core", None, True),
+                                 ("malonetau.lt", "plugin", "wordfence", False)])
+
+    def test_nightly_switch(self):
+        calls = self.enable_updates()
+        code, reply = self.post_update({"site": "sveikas.info", "enabled": True}, path="/api/nightly")
+        self.assertEqual((code, reply["nightly"]["sveikas.info"]["enabled"]), (200, True))
+        for body in ({"site": "giesmynas.adventistai.lt", "enabled": True}, {"site": "nosuch.example", "enabled": True},
+                     {"site": "sveikas.info", "enabled": "on"}, {"site": "sveikas.info"}):
+            with self.subTest(body=body):
+                self.assertEqual(self.post_update(body, path="/api/nightly")[0], 400)
+        self.assertEqual(calls, [("nightly", "sveikas.info", True)])
+        self.assertEqual(self.post_update({"site": "sveikas.info", "enabled": False}, path="/api/nightly",
+                                          origin="https://attacker.example")[0], 403)
+
+    def test_update_without_snapshot_refused(self):
+        self.enable_updates()
+        self.state.data = None
+        self.assertEqual(self.post_update({"site": "dievozodis.lt", "kind": "core"})[0], 400)
+
+    def test_update_needs_same_origin_and_one_at_a_time(self):
+        calls = self.enable_updates()
+        self.assertEqual(self.post_update({"site": "dievozodis.lt", "kind": "core"}, origin="https://attacker.example")[0], 403)
+        self.state.update_lock.acquire()
+        try:
+            self.assertEqual(self.post_update({"site": "dievozodis.lt", "kind": "core"})[0], 409)
+        finally:
+            self.state.update_lock.release()
+        self.assertEqual(calls, [])
 
     def test_missing_and_stale_preserved_on_failure(self):
         previous = self.state.data
