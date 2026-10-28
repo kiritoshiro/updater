@@ -383,6 +383,11 @@ class ViewerTests(unittest.TestCase):
                 self.assertEqual(self.post_update(body)[0], 400)
         self.assertEqual(calls, [("adventistai.lt", "plugin", "wordfence"), ("dievozodis.lt", "core", None)])
 
+    def test_update_without_snapshot_refused(self):
+        self.enable_updates()
+        self.state.data = None
+        self.assertEqual(self.post_update({"site": "dievozodis.lt", "kind": "core"})[0], 400)
+
     def test_update_needs_same_origin_and_one_at_a_time(self):
         calls = self.enable_updates()
         self.assertEqual(self.post_update({"site": "dievozodis.lt", "kind": "core"}, origin="https://attacker.example")[0], 403)

@@ -19,12 +19,14 @@ echo "== refusals"
 out=$(runuser -u darius -- /usr/local/sbin/site-update $SITE plugin classic-editor 2>&1); code=$?
 check "without sudo: refused (exit $code)" test $code -eq 2 -a -n "$(grep -o 'must run as root' <<<"$out")"
 before=$(backups)
-for args in "$SITE plugin ;id" "$SITE plugin ../../wp-config" "$SITE plugin a;rm" "$SITE plugin unknown-slug" \
-            "$SITE theme classic-editor" "$SITE plugin twentytwentyfive" "$SITE core extra" "$SITE shell" \
-            "nosuch.test plugin classic-editor" "$SITE plugin -x" "../$SITE plugin classic-editor"; do
+# expected exit: 2 = argument error or refused, 1 = unknown site (setup)
+for case in "2|$SITE plugin ;id" "2|$SITE plugin ../../wp-config" "2|$SITE plugin a;rm" "2|$SITE plugin unknown-slug" \
+            "2|$SITE theme classic-editor" "2|$SITE plugin twentytwentyfive" "2|$SITE core extra" "2|$SITE shell" \
+            "1|nosuch.test plugin classic-editor" "2|$SITE plugin -x" "1|../$SITE plugin classic-editor"; do
+  expected=${case%%|*} args=${case#*|}
   # shellcheck disable=SC2086
   update $args >/dev/null 2>&1; code=$?
-  check "refused: $args (exit $code)" test $code -ne 0
+  check "refused: $args (exit $code, expected $expected)" test $code -eq "$expected"
 done
 cp -p /var/lib/site-watch/status.json /root/status.keep
 python3 - <<'PY'
@@ -87,6 +89,35 @@ check "cookie consent still active" test "$(wpv plugin get adventistai-cookie-co
 collect
 update $SITE plugin adventistai-cookie-consent >/dev/null 2>&1; code=$?
 check "second run refused: no update in inventory (exit $code)" test $code -eq 2
+
+echo "== signals: SIGTERM after the backup rolls back, SIGHUP is ignored"
+backed_up() {  # wait until this run's backup tar exists (newer than the marker touched before the run)
+  for _ in $(seq 1 240); do
+    [ -n "$(find /var/backups/site-update/$SITE -maxdepth 2 -name files.tar -newer "$1" 2>/dev/null)" ] && return 0
+    sleep 0.25
+  done
+  return 1
+}
+updater_pid() { pgrep -f "from sitewatch.updater import main"; }
+touch /tmp/term.mark; sleep 1
+update $SITE plugin akismet > /tmp/term.out 2>&1 & p=$!
+sent=no; backed_up /tmp/term.mark && kill -TERM "$(updater_pid)" && sent=yes
+wait $p; code=$?
+check "SIGTERM sent after the backup" test $sent = yes
+check "SIGTERM: rolled back (exit $code)" test $code -eq 3 -a "$(last result)" = rolled_back
+check "SIGTERM: logged as interrupted" bash -c "tail -n 1 $LOG | grep -q interrupted"
+check "SIGTERM: akismet back at 5.3.6" test "$(wpv plugin get akismet --field=version)" = "5.3.6"
+check "SIGTERM: front page 200, no maintenance file" test "$(front)" = 200 -a ! -e "$ROOT/.maintenance"
+touch /tmp/hup.mark; sleep 1
+update $SITE theme twentytwentythree > /tmp/hup.out 2>&1 & p=$!
+# A hangup reaches the dashboard user's sudo and site-update, not the commands site-update starts.
+pid=""; backed_up /tmp/hup.mark && pid=$(updater_pid)
+sent=no; [ -n "$pid" ] && kill -HUP "$(ps -o ppid= -p "$pid" | tr -d ' ')" "$pid" && sent=yes
+wait $p; code=$?
+check "SIGHUP sent to sudo and site-update after the backup" test $sent = yes
+check "SIGHUP to sudo and site-update: update finished (exit $code)" test $code -eq 0 -a "$(last result)" = updated
+check "SIGHUP: twentytwentythree updated to $(wpv theme get twentytwentythree --field=version)" \
+  test "$(wpv theme get twentytwentythree --field=version)" != "1.6"
 
 echo "== core: a broken update rolls back, then a good one"
 breaks "core::6.7.2"

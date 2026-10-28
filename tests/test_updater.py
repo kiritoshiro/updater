@@ -195,9 +195,117 @@ class UpdateFlowTests(unittest.TestCase):
             self.skipTest("symlinks unavailable")
         self.assertEqual(self.updater(FakeSite(None)).update("plugin", "classic")["result"], "refused")
 
+    def failing_after_backup(self, error, where="apply"):
+        fake = FakeSite(None)
+        updater_ = self.updater(fake)
+        original = getattr(updater_, where)
+        def broken(*args, **kwargs):
+            if where != "apply":
+                original(*args, **kwargs)
+            raise error
+        setattr(updater_, where, broken)
+        return updater_, fake
+
+    def test_interrupt_after_backup_rolls_back(self):
+        updater_, fake = self.failing_after_backup(KeyboardInterrupt())
+        result = updater_.update("plugin", "classic")
+        self.assertEqual(result["result"], "rolled_back")
+        self.assertIn("interrupted", result["message"])
+        self.assertTrue(updater_.interrupted)
+        self.assertTrue(fake.ran("db", "import", "-"))
+
+    def test_unexpected_error_after_backup_rolls_back(self):
+        updater_, fake = self.failing_after_backup(RuntimeError("boom"), where="version")
+        updater_.version = lambda *a: (_ for _ in ()).throw(RuntimeError("boom")) if fake.version == "1.1" else fake.version
+        result = updater_.update("plugin", "classic")
+        self.assertEqual(result["result"], "rolled_back")
+        self.assertIn("unexpected error", result["message"])
+        self.assertFalse(updater_.interrupted)
+
+    def test_interrupt_before_backup_changes_nothing(self):
+        updater_ = self.updater(FakeSite(None))
+        updater_.health = lambda: (_ for _ in ()).throw(KeyboardInterrupt())
+        result = updater_.update("plugin", "classic")
+        self.assertEqual(result["result"], "refused")
+        self.assertIn("before anything was changed", result["message"])
+        self.assertEqual(list(self.backups.iterdir()), [])
+
+    def test_broken_output_does_not_stop_rollback(self):
+        def say(*_):
+            raise BrokenPipeError()
+        fake = FakeSite(None)
+        self.health_results = [True] + [False] * updater.HEALTH_ATTEMPTS
+        updater_ = Updater(self.site, self.inventory, run=fake, health=self.health, sleep=lambda _: None,
+                           backups=self.backups, say=say)
+        self.assertEqual(updater_.update("plugin", "classic")["result"], "rolled_back")
+
+    def test_unreadable_new_version_rolls_back(self):
+        fake = FakeSite(None, after=None)
+        result = self.updater(fake).update("plugin", "classic")
+        self.assertEqual(result["result"], "rolled_back")
+        self.assertIn("could not be read", result["message"])
+
+    def test_failed_recheck_is_rollback_failed_and_kept(self):
+        fake = FakeSite(None)
+        calls = iter([True])
+        def health():
+            ok = next(calls, None)
+            if ok is None:
+                raise RuntimeError("check crashed")
+            return [{"path": "/", "status": 200, "ok": ok}]
+        updater_ = Updater(self.site, self.inventory, run=fake, health=health, sleep=lambda _: None,
+                           backups=self.backups, say=lambda *_: None)
+        result = updater_.update("plugin", "classic")
+        self.assertEqual(result["result"], "rollback_failed")
+        self.assertTrue((Path(result["backup"]) / "KEEP").exists())
+        past = time.time() - 30 * 86400
+        os.utime(result["backup"], (past, past))
+        updater.prune_backups(self.backups)
+        self.assertTrue(Path(result["backup"]).exists())
+
+    def test_core_rollback_moves_new_core_folders_aside(self):
+        root = Path(self.site["path"])
+        for name in ("wp-admin", "wp-includes"):
+            (root / name).mkdir()
+        for name in ("index.php", "wp-config.php", "wp-load.php"):
+            (root / name).write_text("<?php")
+        self.inventory["core"]["update_version"] = "6.9"
+        fake = FakeSite(None)
+        self.health_results = [True] + [False] * updater.HEALTH_ATTEMPTS
+        def run(argv, timeout=65, stdin=None, stdout=None):
+            args = argv[argv.index("--no-color") + 1:] if "--no-color" in argv else []
+            if args[:2] == ["core", "update"]:
+                fake.version = "1.1"
+            return fake(argv, timeout, stdin, stdout)
+        result = Updater(self.site, self.inventory, run=run, health=self.health, sleep=lambda _: None,
+                         backups=self.backups, say=lambda *_: None).update("core")
+        self.assertEqual(result["result"], "rolled_back")
+        tar = next(c for c in fake.calls if c[0] == "/usr/bin/tar" and "-cf" in c)
+        self.assertNotIn("wp-config.php", tar)
+        self.assertTrue({"wp-admin", "wp-includes", "index.php"} <= set(tar))
+        moved = [Path(c[-2]).name for c in fake.calls if c[0] == "/usr/bin/mv"]
+        self.assertEqual(sorted(moved), ["wp-admin", "wp-includes"])
+
     def test_pending_lists_plugins_and_themes_only(self):
         self.inventory["core"]["update_version"] = "6.9"
         self.assertEqual(self.updater(FakeSite(None)).pending(), [("plugin", "classic"), ("plugin", "cookie")])
+
+
+class SignalTests(unittest.TestCase):
+    def tearDown(self):
+        updater.STOP.update(held=0, requested=False)
+
+    def test_interrupt_waits_while_restoring(self):
+        with updater.signals_held():
+            updater.interrupt()  # must not raise inside a restore or log write
+        self.assertTrue(updater.STOP["requested"])
+        with self.assertRaises(KeyboardInterrupt):
+            updater.interrupt()
+
+    def test_oversized_archive_refused_before_reading(self):
+        data, digest = archive(PLUGIN)
+        with patch.object(updater, "MAX_UNZIPPED_BYTES", 10), self.assertRaises(Refused):
+            check_archive(data, digest, "plugin", "cookie", "1.0.17")
 
 
 class CommandLineTests(unittest.TestCase):

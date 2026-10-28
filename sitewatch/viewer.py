@@ -52,8 +52,8 @@ class State:
 
     def update(self, request):
         """Run one update the current snapshot reports; the server checks again before acting."""
-        if not self.payload()["capabilities"]["updates"]:
-            raise ValueError("Updates are not enabled for this dashboard")
+        if not self.payload()["capabilities"]["updates"] or not self.data:
+            raise ValueError("Updates are not enabled for this dashboard, or no snapshot is loaded")
         if not isinstance(request, dict) or set(request) - {"site", "kind", "slug"}:
             raise ValueError("Invalid update request")
         site_id, kind, slug = request.get("site"), request.get("kind"), request.get("slug")
