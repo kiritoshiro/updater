@@ -47,7 +47,6 @@ SETTLE_SECONDS = 3  # PHP's opcache rechecks changed files every 2 s by default
 LOCK_WAIT, DASHBOARD_LOCK_WAIT = 20 * 60, 5 * 60
 MAX_INVENTORY_AGE = 3 * 3600
 EXIT_CODES = {"updated": 0, "unchanged": 0, "refused": 2, "rolled_back": 3, "rollback_failed": 4}
-RESULTS = tuple(EXIT_CODES)
 CORE_FILES = re.compile(r"(?!wp-config\.php\Z)[a-z0-9-]+\.php\Z|license\.txt\Z|readme\.html\Z|wp-admin\Z|wp-includes\Z")
 DIGEST = re.compile(r"sha256:([0-9a-f]{64})\Z")
 VERSION_HEADER = re.compile(rb"^[ \t/*#@]*Version:[ \t]*([0-9][0-9a-zA-Z.+-]*)", re.MULTILINE | re.IGNORECASE)
@@ -189,7 +188,9 @@ class Updater:
         return self.run(collector.as_owner(self.site, *argv, limit=limit), timeout=limit + 10, **streams)
 
     def healthy(self):
+        """Origin checks, retried. A stop request is taken before each attempt (not during a restore)."""
         for attempt in range(HEALTH_ATTEMPTS):
+            stop_requested()
             checks = self.health()
             if checks and all(check["ok"] for check in checks):
                 return True, checks
@@ -351,7 +352,7 @@ class Updater:
         except BaseException as exc:
             self.interrupted = self.interrupted or not isinstance(exc, Exception)
             reason = "Interrupted" if self.interrupted else "Stopped on an unexpected error"
-            if result["backup"] and result["result"] not in RESULTS:
+            if result["backup"] and result["result"] in ("refused", "failed"):
                 # Defensive: something escaped after the backup; put the site back.
                 result.update(self.rollback(*self.last_backup, kind, slug, result["from"], reason))
             elif not result["backup"]:
@@ -372,8 +373,10 @@ class Updater:
         if kind != "translations" and result["to"] is None:
             result.update(result="failed", failure="The new version could not be read")
             return
+        stop_requested()
         self.sleep(SETTLE_SECONDS)
         ok, checks = self.healthy()
+        stop_requested()  # a stop during the last check still rolls back, as documented
         result["health"] = [{"path": c["path"], "status": c.get("status"), "ok": c["ok"]} for c in checks]
         if not ok:
             result.update(result="failed", failure="The site failed its origin health check after the update")
@@ -564,7 +567,7 @@ def main(argv=None):
                 result["user"] = user if re.fullmatch(r"[a-z_][a-z0-9_-]{0,31}", user) else "root"
                 try:
                     append_log(STATE_DIR, [result])  # each item as soon as it is done
-                except (OSError, KeyError):
+                except (OSError, KeyError, ValueError):
                     result["message"] += ". The update log could not be written"
                 results.append(result)
                 say(describe(result))

@@ -31,10 +31,11 @@ ENV = {"PATH": "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin", "
 
 
 def run(argv, timeout=65):
+    # Own session: Ctrl+C or a hangup at site-update's terminal must not kill a check halfway.
     try:
         proc = subprocess.run(argv, stdin=subprocess.DEVNULL, capture_output=True,
                               text=True, encoding="utf-8", errors="replace", timeout=timeout,
-                              check=False, env=ENV, cwd="/")
+                              check=False, env=ENV, cwd="/", start_new_session=os.name == "posix")
     except (OSError, subprocess.TimeoutExpired) as exc:
         raise CheckFailed("Command unavailable or timed out") from exc
     if proc.returncode or len(proc.stdout) > 4 * 1024 * 1024:

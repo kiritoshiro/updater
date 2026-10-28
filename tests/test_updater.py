@@ -326,7 +326,27 @@ class SignalTests(unittest.TestCase):
         with updater.signals_held():
             self.assertEqual(updater.execute(["/bin/echo", "done"], timeout=10), "done")
 
-    def test_interrupt_after_backup_with_failing_output_still_rolls_back(self):
+    def test_stop_during_health_check_rolls_back(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "site/wp-content/plugins/classic").mkdir(parents=True)
+            (root / "backups").mkdir()
+            site = {"id": "example.org", "owner": "example", "path": str(root / "site"), "origin_ip": "203.0.113.10", "ca_file": None, "github": {}}
+            inventory = {"plugins": [{"name": "classic", "version": "1.0", "update_version": "1.1"}], "themes": []}
+            fake, checks = FakeSite(None), []
+            def health():
+                checks.append(fake.version)
+                if fake.version == "1.1" and len(checks) == 2:
+                    updater.interrupt()  # Ctrl+C while the site is checked after the update
+                return [{"path": "/", "status": 200, "ok": True}]
+            if not hasattr(os, "fchmod"):
+                self.skipTest("os.fchmod needs Unix or Python 3.13+")
+            result = Updater(site, inventory, run=fake, health=health, sleep=lambda _: None,
+                             backups=root / "backups", say=lambda *_: None).update("plugin", "classic")
+            self.assertEqual((result["result"], result["to"]), ("rolled_back", "1.0"))
+            self.assertIn("interrupted", result["message"])
+
+    def test_second_signal_during_rollback_does_not_stop_it(self):
         # A second signal during the rollback must not stop it: only the flag is set.
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
