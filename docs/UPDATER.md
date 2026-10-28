@@ -10,8 +10,30 @@ sudo site-update <site> theme <slug>
 sudo site-update <site> core
 sudo site-update <site> translations
 sudo site-update <site> all            # every plugin and theme update in the inventory, one by one
+sudo site-update --files-only-rollback <site> plugin <slug>   # on failure, restore files but not the database
+sudo site-update <site> nightly on|off # the site's nightly switch
 sudo site-update --json <site> ...     # one JSON line for the dashboard
+site-update --nightly-run              # (root, from site-update-nightly.timer) the nightly updates
 ```
+
+Only darius may run it (one sudoers line; user decision 2026-10-28).
+
+## Nightly updates
+
+Each WordPress site has a nightly switch, off by default, set from the dashboard's Nightly column or
+with `site-update <site> nightly on|off`. It is stored in `/var/lib/site-watch/nightly.json`
+(root:sitewatch 0640, with who changed it and when). `site-update-nightly.timer` runs every night at
+about 03:30–03:50. For every site that is switched on it:
+
+1. runs the collector, so the inventory is fresh;
+2. updates every reported plugin and theme, then a WordPress release of the installed x.y branch
+   (how WordPress ships security fixes), one at a time, each exactly as a manual update: backup,
+   health check, automatic rollback (database included);
+3. stops for that site at the first update that is refused or rolled back, and goes on with the next site.
+
+A new WordPress major version (for example 6.9 to 7.0) is never installed at night. Results are in the
+update log with user `nightly`, shown under Recent updates. With `DISALLOW_FILE_MODS` on, WordPress's
+own automatic background updates are off, so the switch is how a locked site stays current.
 
 Exit codes: 0 updated or nothing to change, 1 setup problem, 2 refused (nothing changed),
 3 rolled back (site healthy again), 4 rollback failed (check the site now).
@@ -73,9 +95,11 @@ Exit codes: 0 updated or nothing to change, 1 setup problem, 2 refused (nothing 
 
 ## Known limits
 
-- **The database is restored on rollback.** Anything written to the site between the backup and
-  the rollback (normally a minute or two: comments, form entries, orders) is lost. Restoring was
-  chosen over keeping a database that a failed plugin version may have migrated.
+- **By default the database is restored on rollback.** Anything written to the site between the
+  backup and the rollback (normally a minute or two: comments, form entries, orders) is lost.
+  Restoring was chosen over keeping a database that a failed plugin version may have migrated.
+  Per update, the dashboard's checkbox (or `--files-only-rollback`) restores only the files and
+  leaves the database as it is; the database backup is still taken.
 - A core rollback restores `wp-admin`, `wp-includes` and the root PHP files. Anything a core update
   adds under `wp-content` (for example a new bundled theme) stays.
 - The health check cannot see a page cache, and relies on PHP noticing changed files. Server 561363

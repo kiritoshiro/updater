@@ -1,0 +1,20 @@
+[Unit]
+Description=WP Site Watch nightly updates for sites whose nightly switch is on
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=oneshot
+User=root
+Group=root
+ExecStart=/usr/local/sbin/site-update --nightly-run
+UMask=0027
+# Collector run, then each update with backup, check and possible rollback.
+TimeoutStartSec=4h
+PrivateTmp=true
+ProtectSystem=full
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+# Do not set NoNewPrivileges: updates run as each site owner through sudo.
+# Do not use ProtectHome: site roots live under /home.

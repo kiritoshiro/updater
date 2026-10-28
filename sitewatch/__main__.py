@@ -4,7 +4,7 @@ from pathlib import Path
 import webbrowser
 
 from .demo import sample
-from .transport import fetch_file, fetch_ssh, fetch_update_log, run_update, ssh_command
+from .transport import SshUpdates, fetch_file, fetch_ssh, ssh_command
 from .viewer import State, make_server
 
 
@@ -28,7 +28,7 @@ def main():
             ssh_command(config)
             loader, label = lambda: fetch_ssh(config), "SSH · read only"
             if config.get("updates") is True:
-                updates = (lambda site, kind, slug: run_update(config, site, kind, slug), lambda: fetch_update_log(config))
+                updates = SshUpdates(config)
                 label = "SSH · updates enabled"
         state = State(loader, label, updates)
         state.refresh()

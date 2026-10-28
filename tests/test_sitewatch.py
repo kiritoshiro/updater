@@ -122,8 +122,25 @@ class TransportTests(unittest.TestCase):
         run.return_value = subprocess.CompletedProcess([], 1, b'{"error": "Another update is still running; try again later"}', b"")
         with self.assertRaises(ValueError):
             transport.run_update(config, "example.org", "plugin", "x")
-        run.return_value = subprocess.CompletedProcess([], 0, b'{"result": "updated"}\nnot json\n{"result": "bad"}\n', b"")
-        self.assertEqual(len(transport.fetch_update_log(config)), 1)
+        state = (b'{"result": "updated"}\nnot json\n{"result": "bad"}\n' + transport.NIGHTLY_MARK.encode()
+                 + b'\n{"sites": {"example.org": {"enabled": true, "by": "darius"}, "bad site": {"enabled": true},'
+                 + b' "other.org": {"enabled": "yes"}}}\n')
+        run.return_value = subprocess.CompletedProcess([], 0, state, b"")
+        history, nightly = transport.fetch_server_state(config)
+        self.assertEqual(len(history), 1)
+        self.assertEqual(nightly, {"example.org": {"enabled": True, "by": "darius"}})
+
+    def test_rollback_choice_and_nightly_commands(self):
+        config = {"host": "example.org", "user": "darius", "port": 5567}
+        self.assertEqual(transport.update_command(config, "example.org", "plugin", "x", restore_database=False)[-1],
+                         "sudo -n /usr/local/sbin/site-update --json --files-only-rollback example.org plugin x")
+        self.assertEqual(transport.nightly_command(config, "example.org", True)[-1],
+                         "sudo -n /usr/local/sbin/site-update --json example.org nightly on")
+        for args in (("example.org", "yes"), ("example.org;id", True), ("example.org", 1)):
+            with self.subTest(args=args), self.assertRaises(ValueError):
+                transport.nightly_command(config, *args)
+        with self.assertRaises(ValueError):
+            transport.update_command(config, "example.org", "core", None, "false")
 
 
 class CollectorTests(unittest.TestCase):
@@ -303,6 +320,22 @@ class CollectorTests(unittest.TestCase):
         self.assertEqual(info["failed_units"], ["nginx.service"])
 
 
+class FakeUpdates:
+    def __init__(self, calls):
+        self.calls = calls
+
+    def run(self, site, kind, slug, restore_database=True):
+        self.calls.append((site, kind, slug, restore_database))
+        return [{"result": "updated"}]
+
+    def server_state(self):
+        return [], {}
+
+    def set_nightly(self, site, enabled):
+        self.calls.append(("nightly", site, enabled))
+        return {"enabled": enabled, "by": "darius"}
+
+
 class ViewerTests(unittest.TestCase):
     def setUp(self):
         self.state = State(sample, "Demo")
@@ -344,10 +377,10 @@ class ViewerTests(unittest.TestCase):
         headers = {"Origin": self.origin, "X-Site-Watch-Token": self.state.token}
         self.assertEqual(self.request("POST", "/api/refresh", headers)[0], 200)
 
-    def post_update(self, body, origin=None):
+    def post_update(self, body, origin=None, path="/api/update"):
         raw = json.dumps(body).encode()
         connection = http.client.HTTPConnection("127.0.0.1", self.server.server_port, timeout=3)
-        connection.request("POST", "/api/update", raw, {"Origin": origin or self.origin, "X-Site-Watch-Token": self.state.token,
+        connection.request("POST", path, raw, {"Origin": origin or self.origin, "X-Site-Watch-Token": self.state.token,
                                                          "Content-Type": "application/json", "Content-Length": str(len(raw))})
         response = connection.getresponse()
         code, reply = response.status, json.loads(response.read())
@@ -358,7 +391,7 @@ class ViewerTests(unittest.TestCase):
         calls = []
         live = sample(); live["demo"] = False
         self.state.loader = lambda: live
-        self.state.updates = (lambda site, kind, slug: calls.append((site, kind, slug)) or [{"result": "updated"}], lambda: [])
+        self.state.updates = FakeUpdates(calls)
         self.state.refresh()
         return calls
 
@@ -368,7 +401,7 @@ class ViewerTests(unittest.TestCase):
         self.assertFalse(reply["capabilities"]["updates"])
 
     def test_demo_data_never_offers_updates(self):
-        self.state.updates = (lambda *_: self.fail("must not run"), lambda: [])
+        self.state.updates = FakeUpdates([])
         self.assertFalse(self.state.payload()["capabilities"]["updates"])
 
     def test_update_runs_only_reported_updates(self):
@@ -381,7 +414,22 @@ class ViewerTests(unittest.TestCase):
                      {"site": "adventistai.lt", "kind": "all"}, {"site": "adventistai.lt", "kind": "plugin", "slug": "wordfence", "extra": 1}):
             with self.subTest(body=body):
                 self.assertEqual(self.post_update(body)[0], 400)
-        self.assertEqual(calls, [("adventistai.lt", "plugin", "wordfence"), ("dievozodis.lt", "core", None)])
+        self.assertEqual(self.post_update({"site": "malonetau.lt", "kind": "plugin", "slug": "wordfence", "restore_database": False})[0], 200)
+        self.assertEqual(self.post_update({"site": "malonetau.lt", "kind": "plugin", "slug": "wordfence", "restore_database": "no"})[0], 400)
+        self.assertEqual(calls, [("adventistai.lt", "plugin", "wordfence", True), ("dievozodis.lt", "core", None, True),
+                                 ("malonetau.lt", "plugin", "wordfence", False)])
+
+    def test_nightly_switch(self):
+        calls = self.enable_updates()
+        code, reply = self.post_update({"site": "sveikas.info", "enabled": True}, path="/api/nightly")
+        self.assertEqual((code, reply["nightly"]["sveikas.info"]["enabled"]), (200, True))
+        for body in ({"site": "giesmynas.adventistai.lt", "enabled": True}, {"site": "nosuch.example", "enabled": True},
+                     {"site": "sveikas.info", "enabled": "on"}, {"site": "sveikas.info"}):
+            with self.subTest(body=body):
+                self.assertEqual(self.post_update(body, path="/api/nightly")[0], 400)
+        self.assertEqual(calls, [("nightly", "sveikas.info", True)])
+        self.assertEqual(self.post_update({"site": "sveikas.info", "enabled": False}, path="/api/nightly",
+                                          origin="https://attacker.example")[0], 403)
 
     def test_update_without_snapshot_refused(self):
         self.enable_updates()

@@ -69,6 +69,9 @@ sudo install -o root -g root -m 0755 deploy/site-update /usr/local/sbin/site-upd
 sudo install -o root -g root -m 0440 deploy/site-update.sudoers /etc/sudoers.d/site-update
 sudo visudo -cf /etc/sudoers.d/site-update
 sudo install -d -o root -g root -m 0700 /var/backups/site-update
+sudo install -o root -g root -m 0644 deploy/site-update-nightly.service deploy/site-update-nightly.timer /etc/systemd/system/
+sudo systemctl daemon-reload
+sudo systemctl enable --now site-update-nightly.timer   # does nothing until a site's nightly switch is on
 ```
 
 3. Optional: add an archive page to each site's `health_paths` in `/etc/site-watch/collector.json`, e.g. `"health_paths": ["/", "/wp-login.php", "/category/naujienos/"]`.
@@ -81,4 +84,4 @@ sudo -n /usr/bin/id                                                   # must fai
 
 5. Run a first real update by hand on one site, on a plugin you can live without for a minute, and read the result and `/var/lib/site-watch/update-log.jsonl`. Then set `"updates": true` in the viewer's `config.local.json`.
 
-To remove it: `sudo rm /etc/sudoers.d/site-update /usr/local/sbin/site-update`. The update log and backups stay until deleted; backups are pruned only by `site-update` itself.
+To remove it: `sudo systemctl disable --now site-update-nightly.timer`, then `sudo rm /etc/sudoers.d/site-update /usr/local/sbin/site-update /etc/systemd/system/site-update-nightly.*`. The update log and backups stay until deleted; backups are pruned only by `site-update` itself.

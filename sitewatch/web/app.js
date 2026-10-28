@@ -29,10 +29,11 @@ function renderSites() {
     tr.append(cell(badge(count ? `${count} available` : 'None reported', count ? 'warn' : 'neutral')));
     const flag = site.flags?.DISALLOW_FILE_MODS;
     tr.append(cell(badge(site.kind !== 'wordpress' ? '—' : flag === true ? 'Locked' : flag === false ? 'Allowed' : 'Unknown', flag === true ? 'good' : 'neutral')));
+    tr.append(cell(nightlyControl(site)));
     const inspect = node('button', '↗', 'filter'); inspect.setAttribute('aria-label', `Inspect ${site.id}`); inspect.addEventListener('click', e => {e.stopPropagation(); showDetail(site);});
     tr.append(cell(inspect)); tr.addEventListener('click', () => showDetail(site)); body.append(tr);
   }
-  if (!sites.length) { const tr = node('tr'); const td = node('td', snapshot ? 'No sites match this view.' : 'No snapshot available. Check your file or SSH configuration.', 'empty'); td.colSpan = 6; tr.append(td); body.append(tr); }
+  if (!sites.length) { const tr = node('tr'); const td = node('td', snapshot ? 'No sites match this view.' : 'No snapshot available. Check your file or SSH configuration.', 'empty'); td.colSpan = 7; tr.append(td); body.append(tr); }
   $('table-count').textContent = sites.length;
   $('table-foot').textContent = `Showing ${sites.length} of ${snapshot?.sites.length || 0} sites`;
 }
@@ -83,12 +84,14 @@ function itemLabel(r) { return r.kind === 'core' ? 'WordPress core' : r.kind ===
 function showBanner(text, error) { $('banner').textContent = text; $('banner').hidden = false; $('banner').classList.toggle('error', error); $('banner').scrollIntoView({block: 'nearest', behavior: 'smooth'}); }
 async function runUpdate(site, item) {
   const what = item.type === 'core' ? 'WordPress core' : item.name;
-  if (!confirm(`Update ${what} on ${site.id} from ${item.version || '?'} to ${item.update_version}?\n\nA backup of its files and the database is taken first. If the site fails its health check afterwards, the backup is restored automatically.`)) return;
+  const answer = await ask({title: `Update ${what} on ${site.id}?`, ok: 'Update', option: true,
+    text: `${item.version || '?'} → ${item.update_version}. A backup of its files and the database is taken first. If the site fails its health check afterwards, the backup is restored automatically.`});
+  if (!answer) return;
   updating = true; renderUpdates();
   showBanner(`Updating ${what} on ${site.id}. This can take a few minutes; keep this page open.`, false);
   try {
     const response = await fetch('/api/update', {method: 'POST', headers: {'Content-Type': 'application/json', 'X-Site-Watch-Token': payload.refresh_token},
-      body: JSON.stringify({site: site.id, kind: item.type, slug: item.type === 'core' ? null : item.name})});
+      body: JSON.stringify({site: site.id, kind: item.type, slug: item.type === 'core' ? null : item.name, restore_database: answer.restoreDatabase})});
     const data = await response.json();
     if ('status' in data) render(data);
     const r = data.results?.[data.results.length - 1];
@@ -97,6 +100,45 @@ async function runUpdate(site, item) {
     showBanner('The update request failed. Check the update log before trying again.', true);
   } finally {
     updating = false; renderUpdates(); setTimeout(() => load(true), 60000);
+  }
+}
+function ask({title, text, ok, option = false}) {
+  // One dialog for confirmations; resolves to null (cancel) or {restoreDatabase}.
+  return new Promise(resolve => {
+    const dialog = $('confirm'), box = $('confirm-restore-db');
+    $('confirm-title').textContent = title; $('confirm-text').textContent = text; $('confirm-ok').textContent = ok;
+    $('confirm-option').hidden = !option; box.checked = true;
+    const finish = value => { dialog.close(); $('confirm-ok').onclick = $('confirm-cancel').onclick = dialog.oncancel = null; resolve(value); };
+    $('confirm-ok').onclick = () => finish({restoreDatabase: box.checked});
+    $('confirm-cancel').onclick = () => finish(null);
+    dialog.oncancel = e => { e.preventDefault(); finish(null); };
+    dialog.showModal();
+  });
+}
+function nightlyOn(site) { return !!payload?.nightly?.[site.id]?.enabled; }
+function nightlyControl(site) {
+  if (site.kind !== 'wordpress') return node('span', '—');
+  const on = nightlyOn(site);
+  if (!payload?.capabilities?.updates) return badge(on ? 'On' : 'Off', on ? 'good' : 'neutral');
+  const button = node('button', on ? 'On' : 'Off', `filter nightly-toggle${on ? ' on' : ''}`);
+  button.setAttribute('aria-pressed', String(on)); button.setAttribute('aria-label', `Nightly updates for ${site.id}: ${on ? 'on' : 'off'}`);
+  button.addEventListener('click', e => { e.stopPropagation(); setNightly(site, !on); });
+  return button;
+}
+async function setNightly(site, enabled) {
+  const answer = await ask(enabled
+    ? {title: `Turn on nightly updates for ${site.id}?`, ok: 'Turn on',
+       text: 'Every night at about 03:30–03:50 the plugin and theme updates for this site, and WordPress security releases of the installed version, are installed one at a time, each with a backup, a health check and automatic rollback. A new WordPress major version stays a manual update. Results appear under Recent updates.'}
+    : {title: `Turn off nightly updates for ${site.id}?`, ok: 'Turn off', text: 'Updates for this site will only run when you press Update.'});
+  if (!answer) return;
+  try {
+    const response = await fetch('/api/nightly', {method: 'POST', headers: {'Content-Type': 'application/json', 'X-Site-Watch-Token': payload.refresh_token},
+      body: JSON.stringify({site: site.id, enabled})});
+    const data = await response.json();
+    if ('status' in data) render(data);
+    showBanner(response.ok ? `Nightly updates for ${site.id} are ${enabled ? 'on' : 'off'}.` : data.error || 'The change failed.', !response.ok);
+  } catch (_) {
+    showBanner('The change failed. Check the SSH connection.', true);
   }
 }
 function renderHistory() {
@@ -136,6 +178,10 @@ function showDetail(site) {
   const flags = node('div', undefined, 'detail-flags');
   for (const [name, value] of Object.entries(site.flags || {})) flags.append(badge(`${name}: ${value === null ? 'unknown' : String(value)}`, value === null ? 'warn' : 'neutral'));
   body.append(flags);
+  if (site.kind === 'wordpress') {
+    const setting = payload?.nightly?.[site.id];
+    body.append(node('p', setting?.enabled ? `Nightly updates are on (since ${date(setting.changed_at)}${setting.by ? `, ${setting.by}` : ''}).` : 'Nightly updates are off.', 'detail-note'));
+  }
   body.append(node('h3', 'Origin checks'));
   for (const h of site.health || []) {const row = node('div', undefined, 'update-item'); row.append(node('span', h.path), badge(`${h.status || 'Failed'} · ${h.response_ms ?? '—'} ms`, h.ok ? 'good' : 'bad')); body.append(row);}
   for (const key of ['plugins', 'themes']) {

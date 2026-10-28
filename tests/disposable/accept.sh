@@ -79,6 +79,10 @@ check "classic-widgets still active" test "$(wpv plugin get classic-widgets --fi
 check "front page 200 again ($(front))" test "$(front)" = 200
 check "no failed copy left behind" bash -c "! ls -a $ROOT/wp-content/plugins | grep -q site-update-failed"
 check "no maintenance file left" test ! -e "$ROOT/.maintenance"
+update --files-only-rollback $SITE plugin classic-widgets; code=$?
+check "files-only rollback: rolled back (exit $code)" test $code -eq 3 -a "$(last result)" = rolled_back
+check "files-only rollback: database left as it was" bash -c "tail -n 1 $LOG | grep -q 'database was left as it was'"
+check "files-only rollback: classic-widgets back at 0.2, site 200" test "$(wpv plugin get classic-widgets --field=version)" = "0.2" -a "$(front)" = 200
 
 echo "== our GitHub plugin from its verified release"
 update $SITE plugin adventistai-cookie-consent; code=$?
@@ -150,6 +154,24 @@ update $SITE translations; code=$?
 check "translations updated (exit $code)" test $code -eq 0
 update $SITE all; code=$?
 check "all: remaining plugin updated (exit $code)" test $code -eq 0 -a "$(wpv plugin get classic-widgets --field=version)" != "0.2"
+
+echo "== nightly switch and nightly run"
+NIGHTLY=/var/lib/site-watch/nightly.json
+/usr/local/sbin/site-update --nightly-run > /tmp/n0.out 2>&1; code=$?
+check "nightly run with every switch off does nothing (exit $code)" test $code -eq 0 -a -n "$(grep -o 'No site has nightly' /tmp/n0.out)"
+wpv plugin install classic-editor --version=1.6.3 --force --quiet; collect   # something for the night to do
+out=$(update $SITE nightly on); code=$?
+check "darius switches nightly on (exit $code)" test $code -eq 0
+check "nightly.json root:sitewatch 0640, darius can read it, by darius" bash -c "test \"\$(stat -c '%U:%G %a' $NIGHTLY)\" = 'root:sitewatch 640' && runuser -u darius -- grep -q '\"by\": \"darius\"' $NIGHTLY"
+check "the switch is refused for an unknown site" bash -c "! runuser -u darius -- sudo -n /usr/local/sbin/site-update nosuch.test nightly on >/dev/null 2>&1"
+/usr/local/sbin/site-update --nightly-run > /tmp/n1.out 2>&1; code=$?
+check "nightly run updates the site (exit $code)" test $code -eq 0 -a "$(wpv plugin get classic-editor --field=version)" != "1.6.3"
+check "nightly run is logged as user nightly" test "$(last user)" = nightly -a "$(last slug)" = classic-editor
+check "nightly run did not touch core (7.1.3 is current here; minor-only rule is unit-tested)" bash -c "! grep -q ' core' /tmp/n1.out"
+update $SITE nightly off >/dev/null; collect
+wpv plugin install classic-editor --version=1.6.3 --force --quiet; collect
+/usr/local/sbin/site-update --nightly-run > /tmp/n2.out 2>&1
+check "with the switch off again, nothing is updated" test "$(wpv plugin get classic-editor --field=version)" = "1.6.3"
 check "front page 200 at the end" test "$(front)" = 200
 
 echo "== log hygiene"

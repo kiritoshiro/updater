@@ -35,6 +35,7 @@ STATE_DIR = Path("/var/lib/site-watch")
 BACKUP_ROOT = Path("/var/backups/site-update")
 WATCHER = Path("/usr/local/sbin/site-watch")
 LOG_NAME = "update-log.jsonl"
+NIGHTLY_NAME = "nightly.json"
 KINDS = ("plugin", "theme", "core", "translations", "all")
 KEEP_DAYS = 7
 KEEP_LOG_LINES = 1000
@@ -173,8 +174,11 @@ def check_archive(data, sha256, kind, slug, version):
 
 class Updater:
     def __init__(self, site, inventory, run=execute, health=None, release=latest_release, fetch=download,
-                 sleep=time.sleep, backups=BACKUP_ROOT, say=print):
+                 sleep=time.sleep, backups=BACKUP_ROOT, say=print, restore_database=True):
         self.site, self.inventory, self.run, self.sleep, self.backups = site, inventory, run, sleep, backups
+        # False: a failed update restores the files only and leaves the database as it is (the
+        # database backup is still taken, for a manual restore).
+        self.restore_database = restore_database
         self.say = quietly(say)
         self.interrupted = False
         self.release, self.fetch = release, fetch
@@ -274,8 +278,9 @@ class Updater:
                 self.owner("/usr/bin/tar", "-C", str(folder), "-xf", "-", stdin=stream)
             for path in aside:
                 self.owner("/usr/bin/rm", "-rf", "--one-file-system", "--", path)
-        with (directory / "database.sql").open("rb") as stream:
-            self.wp("db", "import", "-", limit=UPDATE_LIMIT, stdin=stream)
+        if self.restore_database:
+            with (directory / "database.sql").open("rb") as stream:
+                self.wp("db", "import", "-", limit=UPDATE_LIMIT, stdin=stream)
         try:
             self.wp("maintenance-mode", "deactivate")
         except CheckFailed:
@@ -398,10 +403,11 @@ class Updater:
                 back = self.version(kind, slug)
             except Exception:
                 ok, back = False, None
+        what = "The backup was restored" if self.restore_database else "The files were restored (the database was left as it was)"
         if ok and back == before:
-            return {"result": "rolled_back", "to": back, "message": f"{failure}. The backup was restored and the site is healthy again"}
+            return {"result": "rolled_back", "to": back, "message": f"{failure}. {what} and the site is healthy again"}
         return {"result": "rollback_failed", "to": back,
-                "message": f"{failure}. The backup was restored but the site is still unhealthy or at the wrong version; check it now ({directory})"}
+                "message": f"{failure}. {what} but the site is still unhealthy or at the wrong version; check it now ({directory})"}
 
     def quiet(self):
         """Ask the alert watcher, if installed, to treat the expected file changes as INFO."""
@@ -412,10 +418,17 @@ class Updater:
         except (OSError, CheckFailed):
             pass
 
-    def pending(self):
-        """Every plugin and theme update in the inventory, for `all`. Core stays a separate decision."""
-        return [(kind, item["name"]) for kind in ("plugin", "theme") for item in self.inventory.get(f"{kind}s", [])
-                if item.get("update_version") and SLUG.fullmatch(str(item.get("name", "")))]
+    def pending(self, core_minor=False):
+        """Every plugin and theme update in the inventory, for `all`. A new WordPress major version
+        stays a manual decision; with core_minor (nightly), a release of the installed x.y branch,
+        which is how WordPress ships security fixes, comes last."""
+        items = [(kind, item["name"]) for kind in ("plugin", "theme") for item in self.inventory.get(f"{kind}s", [])
+                 if item.get("update_version") and SLUG.fullmatch(str(item.get("name", "")))]
+        core = self.inventory.get("core") or {}
+        current, offered = numeric_version(core.get("version")), numeric_version(core.get("update_version"))
+        if core_minor and current and offered and offered > current and offered[:2] == current[:2]:
+            items.append(("core", None))
+        return items
 
 
 def quietly(say):
@@ -521,6 +534,91 @@ def prune_backups(root, now=None):
                     shutil.rmtree(backup)
 
 
+def read_nightly(directory=STATE_DIR):
+    """{site: {"enabled": bool, "changed_at": str, "by": str}}; missing or unreadable means all off."""
+    try:
+        data = json.loads((directory / NIGHTLY_NAME).read_text(encoding="utf-8"))
+        sites = data.get("sites", {}) if isinstance(data, dict) else {}
+        return {k: v for k, v in sites.items() if isinstance(v, dict) and type(v.get("enabled")) is bool}
+    except (OSError, ValueError):
+        return {}
+
+
+def write_nightly(directory, site_id, enabled, user):
+    """Atomic, root:sitewatch 0640 so the dashboard can show the switches."""
+    import grp
+    sites = read_nightly(directory)
+    sites[site_id] = {"enabled": enabled, "changed_at": utcnow(), "by": user}
+    fd, name = tempfile.mkstemp(prefix=".nightly-", dir=directory)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as stream:
+            os.fchmod(stream.fileno(), 0o640)
+            os.fchown(stream.fileno(), 0, grp.getgrnam("sitewatch").gr_gid)
+            json.dump({"sites": sites}, stream, indent=2)
+            stream.write("\n")
+        os.replace(name, directory / NIGHTLY_NAME)
+    finally:
+        if os.path.exists(name):
+            os.unlink(name)
+    return sites[site_id]
+
+
+def run_items(updater, items, user, say, results):
+    """Update items one by one; log each as soon as it is done; stop at the first problem."""
+    for kind, slug in items:
+        result = updater.update(kind, slug)
+        result["user"] = user
+        try:
+            append_log(STATE_DIR, [result])
+        except (OSError, KeyError, ValueError):
+            result["message"] += ". The update log could not be written"
+        results.append(result)
+        say(describe(result))
+        if result["result"] not in ("updated", "unchanged") or updater.interrupted or STOP["requested"]:
+            return False
+    return True
+
+
+def load_inventory(site):
+    status = decode_status((STATE_DIR / "status.json").read_bytes())
+    if freshness(status, max_age=MAX_INVENTORY_AGE)["stale"]:
+        raise ValueError("The inventory is older than 3 hours; check the collector timer first")
+    inventory = next((s for s in status["sites"] if s["id"] == site["id"]), None)
+    if inventory is None:
+        raise ValueError("The site is missing from the last inventory; wait for the collector")
+    return inventory
+
+
+def nightly_run(config, say, results):
+    """Timer job: every site whose nightly switch is on gets its plugin, theme and WordPress minor
+    updates, each with backup, health check and rollback. Runs the collector first."""
+    policy = read_nightly()
+    sites = [s for s in config["sites"] if s.get("kind", "wordpress") == "wordpress" and policy.get(s["id"], {}).get("enabled")]
+    if not sites:
+        say("No site has nightly updates switched on.")
+        return
+    try:
+        with signals_held():
+            execute(["/usr/bin/systemctl", "start", "site-collect.service"], timeout=40 * 60)
+    except CheckFailed:
+        say("The collector run before the nightly updates failed; using the last inventory if it is recent.")
+    with update_lock(STATE_DIR, say, LOCK_WAIT):
+        prune_backups(BACKUP_ROOT)
+        for site in sites:
+            try:
+                collector.validate_owner(site)
+                updater = Updater(site, load_inventory(site), say=say)
+            except (ValueError, OSError, KeyError, CheckFailed) as exc:
+                say(f"{site['id']}: skipped ({exc if isinstance(exc, ValueError) else 'setup problem'})")
+                continue
+            items = updater.pending(core_minor=True)
+            if not items:
+                say(f"{site['id']}: nothing to update.")
+            run_items(updater, items, "nightly", say, results)
+            if updater.interrupted or STOP["requested"]:
+                break
+
+
 def describe(r):
     target = r["kind"] + (f" {r['slug']}" if r["slug"] else "")
     versions = f" {r['from']} → {r['to']}" if r.get("from") and r.get("to") and r["from"] != r["to"] else ""
@@ -530,11 +628,22 @@ def describe(r):
 def main(argv=None):
     parser = argparse.ArgumentParser(prog="site-update", description="Validated WordPress update with backup and rollback")
     parser.add_argument("--json", action="store_true", help="print one JSON line for the dashboard")
-    parser.add_argument("site")
-    parser.add_argument("kind", choices=KINDS)
+    parser.add_argument("--files-only-rollback", action="store_true",
+                        help="if the update fails, restore the files but leave the database as it is")
+    parser.add_argument("--nightly-run", action="store_true", help="run the nightly updates (systemd timer)")
+    parser.add_argument("site", nargs="?")
+    parser.add_argument("kind", nargs="?", choices=KINDS + ("nightly",))
     parser.add_argument("slug", nargs="?")
     args = parser.parse_args(argv)
-    if (args.kind in ("plugin", "theme")) != (args.slug is not None) or (args.slug and not SLUG.fullmatch(args.slug)):
+    if args.nightly_run:
+        if args.site or args.files_only_rollback:
+            parser.error("--nightly-run takes no other arguments")
+    elif not args.site or not args.kind:
+        parser.error("name a site and what to update")
+    elif args.kind == "nightly":
+        if args.slug not in ("on", "off") or args.files_only_rollback:
+            parser.error("nightly takes on or off")
+    elif (args.kind in ("plugin", "theme")) != (args.slug is not None) or (args.slug and not SLUG.fullmatch(args.slug)):
         parser.error("plugin and theme need one valid slug; core, translations and all take none")
     if os.name != "posix" or os.geteuid() != 0:
         parser.error("site-update must run as root on Linux, through sudo")
@@ -544,37 +653,33 @@ def main(argv=None):
     signal.signal(signal.SIGHUP, signal.SIG_IGN)
     signal.signal(signal.SIGTERM, interrupt)
     signal.signal(signal.SIGINT, interrupt)
+    sudo_user = os.environ.get("SUDO_USER", "")
+    user = sudo_user if re.fullmatch(r"[a-z_][a-z0-9_-]{0,31}", sudo_user) else "root"
     results = []
     try:
         config = collector.load_config(CONFIG)
-        site = next((s for s in config["sites"] if s["id"] == args.site), None)
-        if site is None or site.get("kind", "wordpress") != "wordpress":
-            raise ValueError("Unknown WordPress site")
-        collector.validate_owner(site)
-        status = decode_status((STATE_DIR / "status.json").read_bytes())
-        if freshness(status, max_age=MAX_INVENTORY_AGE)["stale"]:
-            raise ValueError("The inventory is older than 3 hours; check the collector timer first")
-        inventory = next((s for s in status["sites"] if s["id"] == site["id"]), None)
-        if inventory is None:
-            raise ValueError("The site is missing from the last inventory; wait for the collector")
-        private_directory(BACKUP_ROOT)
-        with update_lock(STATE_DIR, say, DASHBOARD_LOCK_WAIT if args.json else LOCK_WAIT):
-            prune_backups(BACKUP_ROOT)
-            updater = Updater(site, inventory, say=say)
-            user = os.environ.get("SUDO_USER", "")
-            for kind, slug in updater.pending() if args.kind == "all" else [(args.kind, args.slug)]:
-                result = updater.update(kind, slug)
-                result["user"] = user if re.fullmatch(r"[a-z_][a-z0-9_-]{0,31}", user) else "root"
-                try:
-                    append_log(STATE_DIR, [result])  # each item as soon as it is done
-                except (OSError, KeyError, ValueError):
-                    result["message"] += ". The update log could not be written"
-                results.append(result)
-                say(describe(result))
-                if result["result"] not in ("updated", "unchanged") or updater.interrupted or STOP["requested"]:
-                    break
-            if not results:
-                say("No plugin or theme updates in the last inventory.")
+        if args.nightly_run:
+            private_directory(BACKUP_ROOT)
+            nightly_run(config, say, results)
+        else:
+            site = next((s for s in config["sites"] if s["id"] == args.site), None)
+            if site is None or site.get("kind", "wordpress") != "wordpress":
+                raise ValueError("Unknown WordPress site")
+            if args.kind == "nightly":
+                setting = write_nightly(STATE_DIR, site["id"], args.slug == "on", user)
+                say(f"{site['id']}: nightly updates {'ON' if setting['enabled'] else 'OFF'}.")
+                if args.json:
+                    print(json.dumps({"nightly": {site["id"]: setting}}))
+                return 0
+            collector.validate_owner(site)
+            inventory = load_inventory(site)
+            private_directory(BACKUP_ROOT)
+            with update_lock(STATE_DIR, say, DASHBOARD_LOCK_WAIT if args.json else LOCK_WAIT):
+                prune_backups(BACKUP_ROOT)
+                updater = Updater(site, inventory, say=say, restore_database=not args.files_only_rollback)
+                run_items(updater, updater.pending() if args.kind == "all" else [(args.kind, args.slug)], user, say, results)
+                if not results:
+                    say("No plugin or theme updates in the last inventory.")
         if any(r["result"] in ("updated", "rolled_back", "rollback_failed") for r in results):
             try:  # refresh the dashboard's inventory in the background
                 with signals_held():

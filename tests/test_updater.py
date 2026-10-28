@@ -92,7 +92,7 @@ class FakeSite:
             if self.update_fails:
                 raise CheckFailed("Command failed")
             self.version = self.after
-        if args[:2] == ["db", "import"]:
+        if args[:1] == ["/usr/bin/tar"] and "-xf" in args:  # the old files are back
             self.version = "1.0"
         if args[:2] == ["maintenance-mode", "deactivate"]:
             raise CheckFailed("Command failed")
@@ -291,6 +291,26 @@ class UpdateFlowTests(unittest.TestCase):
         moved = [Path(c[-2]).name for c in fake.calls if c[0] == "/usr/bin/mv"]
         self.assertEqual(sorted(moved), ["wp-admin", "wp-includes"])
 
+    def test_files_only_rollback_keeps_the_database(self):
+        fake = FakeSite(None)
+        self.health_results = [True] + [False] * updater.HEALTH_ATTEMPTS
+        result = self.updater(fake, restore_database=False).update("plugin", "classic")
+        self.assertEqual((result["result"], result["to"]), ("rolled_back", "1.0"))
+        self.assertFalse(fake.ran("db", "import"))
+        self.assertTrue(fake.ran("db", "export", "-"))  # still backed up, for a manual restore
+        self.assertIn("database was left as it was", result["message"])
+
+    def test_nightly_takes_wordpress_minor_releases_only(self):
+        for current, offered, included in (("6.8", "6.8.3", True), ("6.8.2", "6.8.3", True), ("6.8.3", "6.9", False),
+                                           ("6.9", "7.0", False), ("6.8", None, False)):
+            with self.subTest(current=current, offered=offered):
+                self.inventory["core"] = {"version": current, "update_version": offered}
+                items = self.updater(FakeSite(None)).pending(core_minor=True)
+                self.assertEqual(("core", None) in items, included)
+                if included:
+                    self.assertEqual(items[-1], ("core", None))  # after plugins and themes
+        self.assertNotIn(("core", None), self.updater(FakeSite(None)).pending())
+
     def test_pending_lists_plugins_and_themes_only(self):
         self.inventory["core"]["update_version"] = "6.9"
         self.assertEqual(self.updater(FakeSite(None)).pending(), [("plugin", "classic"), ("plugin", "cookie")])
@@ -372,6 +392,22 @@ class SignalTests(unittest.TestCase):
 
 
 class CommandLineTests(unittest.TestCase):
+    def test_nightly_arguments_are_validated(self):
+        for argv in (["example.org", "nightly"], ["example.org", "nightly", "maybe"], ["--nightly-run", "example.org"],
+                     ["--files-only-rollback", "example.org", "nightly", "on"], ["--files-only-rollback", "--nightly-run"], []):
+            with self.subTest(argv=argv), self.assertRaises(SystemExit) as raised, patch("sys.stderr"):
+                updater.main(argv)
+            self.assertEqual(raised.exception.code, 2)
+
+    def test_nightly_policy_ignores_bad_entries(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            self.assertEqual(updater.read_nightly(root), {})
+            (root / "nightly.json").write_text('{"sites": {"a.org": {"enabled": true}, "b.org": {"enabled": "yes"}, "c.org": 1}}')
+            self.assertEqual(updater.read_nightly(root), {"a.org": {"enabled": True}})
+            (root / "nightly.json").write_text("not json")
+            self.assertEqual(updater.read_nightly(root), {})
+
     def test_arguments_are_validated(self):
         for argv in (["example.org", "plugin"], ["example.org", "plugin", "../x"], ["example.org", "core", "x"],
                      ["example.org", "plugin", "a;rm"], ["example.org", "shell"], ["example.org", "plugin", "-x"]):

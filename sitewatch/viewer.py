@@ -18,11 +18,13 @@ class Busy(Exception):
 
 class State:
     def __init__(self, loader, source, updates=None):
-        """updates: (run(site, kind, slug) -> results, history() -> log items), or None for read-only."""
+        """updates: an object with run(site, kind, slug, restore_database), server_state() and
+        set_nightly(site, enabled) (see transport.SshUpdates), or None for a read-only dashboard."""
         self.loader, self.source, self.updates = loader, source, updates
         self.data = None
         self.error = None
         self.history = []
+        self.nightly = {}
         self.token = secrets.token_urlsafe(32)
         self.lock = threading.Lock()
         self.update_lock = threading.Lock()
@@ -39,7 +41,7 @@ class State:
             self.lock.release()
         if self.updates:
             try:
-                self.history = self.updates[1]()
+                self.history, self.nightly = self.updates.server_state()
             except ValueError:
                 pass
 
@@ -48,15 +50,18 @@ class State:
                 "freshness": freshness(self.data) if self.data else None,
                 "refresh_token": self.token, "refreshing": self.lock.locked(),
                 "capabilities": {"updates": bool(self.updates) and not (self.data or {}).get("demo")},
-                "update_running": self.update_lock.locked(), "history": self.history[:20]}
+                "update_running": self.update_lock.locked(), "history": self.history[:20], "nightly": self.nightly}
 
     def update(self, request):
         """Run one update the current snapshot reports; the server checks again before acting."""
         if not self.payload()["capabilities"]["updates"] or not self.data:
             raise ValueError("Updates are not enabled for this dashboard, or no snapshot is loaded")
-        if not isinstance(request, dict) or set(request) - {"site", "kind", "slug"}:
+        if not isinstance(request, dict) or set(request) - {"site", "kind", "slug", "restore_database"}:
             raise ValueError("Invalid update request")
         site_id, kind, slug = request.get("site"), request.get("kind"), request.get("slug")
+        restore_database = request.get("restore_database", True)
+        if type(restore_database) is not bool:
+            raise ValueError("Invalid rollback choice")
         site = next((s for s in self.data["sites"] if s["id"] == site_id and s["kind"] == "wordpress"), None)
         if kind == "core":
             item = (site or {}).get("core") if slug is None else None
@@ -69,11 +74,23 @@ class State:
         if not self.update_lock.acquire(blocking=False):
             raise Busy("Another update is running")
         try:
-            results = self.updates[0](site_id, kind, slug)
+            results = self.updates.run(site_id, kind, slug, restore_database)
         finally:
             self.update_lock.release()
         self.refresh()
         return results
+
+    def set_nightly(self, request):
+        """Switch nightly automatic updates for one WordPress site in the current snapshot."""
+        if not self.payload()["capabilities"]["updates"] or not self.data:
+            raise ValueError("Updates are not enabled for this dashboard, or no snapshot is loaded")
+        if not isinstance(request, dict) or set(request) != {"site", "enabled"} or type(request["enabled"]) is not bool:
+            raise ValueError("Invalid nightly request")
+        if not any(s["id"] == request["site"] and s["kind"] == "wordpress" for s in self.data["sites"]):
+            raise ValueError("Unknown WordPress site")
+        setting = self.updates.set_nightly(request["site"], request["enabled"])
+        self.nightly = {**self.nightly, request["site"]: setting}
+        return setting
 
 
 def make_server(state, port=8765):
@@ -117,7 +134,7 @@ def make_server(state, port=8765):
                 return self.reply(403, {"error": "Invalid origin or token"})
             if self.headers.get("Transfer-Encoding"):
                 return self.reply(400, {"error": "Chunked requests are not accepted"})
-            if self.path == "/api/update":
+            if self.path in ("/api/update", "/api/nightly"):
                 return self.update()
             if self.path != "/api/refresh":
                 return self.reply(404, {"error": "Not found"})
@@ -131,7 +148,10 @@ def make_server(state, port=8765):
             if self.headers.get("Content-Type") != "application/json" or not length.isdigit() or not 0 < int(length) <= 1024:
                 return self.reply(400, {"error": "Send a small JSON body"})
             try:
-                results = state.update(json.loads(self.rfile.read(int(length))))
+                body = json.loads(self.rfile.read(int(length)))
+                if self.path == "/api/nightly":
+                    return self.reply(200, {"nightly_setting": state.set_nightly(body), **state.payload()})
+                results = state.update(body)
             except Busy as exc:
                 return self.reply(409, {"error": str(exc)})
             except ValueError as exc:
