@@ -311,6 +311,29 @@ class UpdateFlowTests(unittest.TestCase):
                     self.assertEqual(items[-1], ("core", None))  # after plugins and themes
         self.assertNotIn(("core", None), self.updater(FakeSite(None)).pending())
 
+    def test_nightly_core_stays_on_the_installed_branch(self):
+        self.inventory["core"] = {"version": "1.0", "update_version": "2.0", "minor_update_version": "1.0.1"}
+        (Path(self.site["path"]) / "wp-admin").mkdir()  # core files to back up and restore
+
+        def core_to(version):
+            fake = FakeSite(None)
+            def run(argv, timeout=65, stdin=None, stdout=None):
+                if "--no-color" in argv and argv[argv.index("--no-color") + 1:][:2] == ["core", "update"]:
+                    fake.version = version
+                return fake(argv, timeout, stdin, stdout)
+            updater_ = self.updater(run)
+            updater_.core_minor_only = True
+            return updater_, fake
+        updater_, fake = core_to("1.0.1")
+        self.assertEqual(updater_.pending(core_minor=True)[-1], ("core", None))
+        self.assertEqual(updater_.update("core")["result"], "updated")
+        self.assertIn(["core", "update", "--minor"], fake.calls)
+        # If WordPress still moved to another branch, it counts as a failed update and is rolled back.
+        updater_, fake = core_to("2.0")
+        result = updater_.update("core")
+        self.assertEqual(result["result"], "rolled_back")
+        self.assertIn("new major version", result["message"])
+
     def test_pending_lists_plugins_and_themes_only(self):
         self.inventory["core"]["update_version"] = "6.9"
         self.assertEqual(self.updater(FakeSite(None)).pending(), [("plugin", "classic"), ("plugin", "cookie")])
@@ -399,6 +422,46 @@ class CommandLineTests(unittest.TestCase):
                 updater.main(argv)
             self.assertEqual(raised.exception.code, 2)
 
+    def test_core_always_restores_the_database(self):
+        with self.assertRaises(SystemExit) as raised, patch("sys.stderr"):
+            updater.main(["--files-only-rollback", "example.org", "core"])
+        self.assertEqual(raised.exception.code, 2)
+
+    def test_nightly_run_logs_skipped_sites_and_stops_per_site(self):
+        from contextlib import nullcontext
+        config = {"sites": [{"id": "a.org", "kind": "wordpress"}, {"id": "b.org", "kind": "wordpress"},
+                            {"id": "c.org", "kind": "wordpress"}, {"id": "d.org", "kind": "web"}]}
+        logged, made = [], []
+
+        class Fake:
+            def __init__(self, site, inventory, say=None):
+                self.site, self.interrupted, self.core_minor_only = site, False, False
+                made.append(self)
+
+            def pending(self, core_minor=False):
+                return [("plugin", "one"), ("plugin", "two")]
+
+            def update(self, kind, slug):
+                result = "rolled_back" if self.site["id"] == "c.org" else "updated"
+                return {"site": self.site["id"], "kind": kind, "slug": slug, "result": result, "message": "m", "from": None, "to": None}
+
+        def validate(site):
+            if site["id"] == "b.org":
+                raise CheckFailed("bad owner")
+        with patch.object(updater, "read_nightly", return_value={"a.org": {"enabled": True}, "b.org": {"enabled": True},
+                                                                 "c.org": {"enabled": True}, "d.org": {"enabled": True}}), \
+             patch.object(updater, "execute"), patch.object(updater, "update_lock", lambda *a: nullcontext()), \
+             patch.object(updater, "prune_backups"), patch.object(updater, "load_inventory", return_value={}), \
+             patch.object(updater.collector, "validate_owner", side_effect=validate), patch.object(updater, "Updater", Fake), \
+             patch.object(updater, "append_log", side_effect=lambda d, items: logged.extend(items)):
+            results = []
+            self.assertEqual(updater.nightly_run(config, lambda *_: None, results), 1)
+        self.assertEqual([(r["site"], r["slug"], r["result"]) for r in results],
+                         [("a.org", "one", "updated"), ("a.org", "two", "updated"), ("c.org", "one", "rolled_back")])
+        self.assertIn(("b.org", "refused"), [(r["site"], r["result"]) for r in logged])
+        self.assertTrue(all(f.core_minor_only for f in made))
+        self.assertTrue(all(r["user"] == "nightly" for r in logged))
+
     def test_nightly_policy_ignores_bad_entries(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -406,6 +469,8 @@ class CommandLineTests(unittest.TestCase):
             (root / "nightly.json").write_text('{"sites": {"a.org": {"enabled": true}, "b.org": {"enabled": "yes"}, "c.org": 1}}')
             self.assertEqual(updater.read_nightly(root), {"a.org": {"enabled": True}})
             (root / "nightly.json").write_text("not json")
+            self.assertEqual(updater.read_nightly(root), {})
+            (root / "nightly.json").write_text('{"sites": ["a.org"]}')
             self.assertEqual(updater.read_nightly(root), {})
 
     def test_arguments_are_validated(self):

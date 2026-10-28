@@ -301,7 +301,10 @@ def collect_site(site, config, releases):
             if result["core"]:
                 current = numeric_version(result["core"]["version"])
                 newer = [v for v in versions if current and numeric_version(v) > current]
-                result["core"].update(check_state="checked", update_version=max(newer, key=numeric_version) if newer else None)
+                # The same x.y branch gets security releases even after a new major version exists.
+                branch = [v for v in newer if numeric_version(v)[:2] == current[:2]]
+                result["core"].update(check_state="checked", update_version=max(newer, key=numeric_version) if newer else None,
+                                      minor_update_version=max(branch, key=numeric_version) if branch else None)
         except (CheckFailed, ValueError, TypeError, KeyError):
             errors.append("Core update check unavailable")
         for kind, key in (("plugin", "plugins"), ("theme", "themes")):

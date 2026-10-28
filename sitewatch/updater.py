@@ -179,6 +179,8 @@ class Updater:
         # False: a failed update restores the files only and leaves the database as it is (the
         # database backup is still taken, for a manual restore).
         self.restore_database = restore_database
+        # Nightly: WordPress core only within the installed x.y branch (wp core update --minor).
+        self.core_minor_only = False
         self.say = quietly(say)
         self.interrupted = False
         self.release, self.fetch = release, fetch
@@ -205,7 +207,8 @@ class Updater:
     def source(self, kind, slug):
         """wordpress.org or github, after checking the update is in the collector's inventory."""
         if kind in ("core", "translations"):
-            if kind == "core" and not (self.inventory.get("core") or {}).get("update_version"):
+            core = self.inventory.get("core") or {}
+            if kind == "core" and not (core.get("update_version") or core.get("minor_update_version")):
                 raise Refused("The last inventory reports no WordPress core update for this site")
             return "wordpress.org"
         item = next((i for i in self.inventory.get(f"{kind}s", []) if i.get("name") == slug), None)
@@ -249,7 +252,14 @@ class Updater:
         folder, names = self.files(kind, slug)
         try:
             directory.parent.mkdir(mode=0o700, exist_ok=True)
-            directory.mkdir(mode=0o700)
+            for attempt in range(2, 12):  # two backups of one item within a second get -2, -3, ...
+                try:
+                    directory.mkdir(mode=0o700)
+                    break
+                except FileExistsError:
+                    directory = directory.with_name(f"{label}-{attempt}")
+            else:
+                raise OSError("No free backup folder name")
             with (directory / "database.sql").open("xb") as stream:
                 os.fchmod(stream.fileno(), 0o600)
                 self.wp("db", "export", "-", limit=UPDATE_LIMIT, stdout=stream)
@@ -291,7 +301,7 @@ class Updater:
             for target in (("core",), ("plugin", "--all"), ("theme", "--all")):
                 self.wp("language", target[0], "update", *target[1:], limit=UPDATE_LIMIT)
         elif kind == "core":
-            self.wp("core", "update", limit=UPDATE_LIMIT)
+            self.wp("core", "update", *(["--minor"] if self.core_minor_only else []), limit=UPDATE_LIMIT)
             self.wp("core", "update-db", limit=UPDATE_LIMIT)
         elif source == "wordpress.org":
             self.wp(kind, "update", slug, limit=UPDATE_LIMIT)
@@ -378,6 +388,10 @@ class Updater:
         if kind != "translations" and result["to"] is None:
             result.update(result="failed", failure="The new version could not be read")
             return
+        old, new = numeric_version(result["from"]), numeric_version(result["to"])
+        if kind == "core" and self.core_minor_only and old and new and new[:2] != old[:2]:
+            result.update(result="failed", failure="WordPress moved to a new major version; nightly updates stay within the installed branch")
+            return
         stop_requested()
         self.sleep(SETTLE_SECONDS)
         ok, checks = self.healthy()
@@ -425,7 +439,8 @@ class Updater:
         items = [(kind, item["name"]) for kind in ("plugin", "theme") for item in self.inventory.get(f"{kind}s", [])
                  if item.get("update_version") and SLUG.fullmatch(str(item.get("name", "")))]
         core = self.inventory.get("core") or {}
-        current, offered = numeric_version(core.get("version")), numeric_version(core.get("update_version"))
+        current = numeric_version(core.get("version"))
+        offered = numeric_version(core.get("minor_update_version") or core.get("update_version"))
         if core_minor and current and offered and offered > current and offered[:2] == current[:2]:
             items.append(("core", None))
         return items
@@ -539,6 +554,8 @@ def read_nightly(directory=STATE_DIR):
     try:
         data = json.loads((directory / NIGHTLY_NAME).read_text(encoding="utf-8"))
         sites = data.get("sites", {}) if isinstance(data, dict) else {}
+        if not isinstance(sites, dict):
+            return {}
         return {k: v for k, v in sites.items() if isinstance(v, dict) and type(v.get("enabled")) is bool}
     except (OSError, ValueError):
         return {}
@@ -546,21 +563,28 @@ def read_nightly(directory=STATE_DIR):
 
 def write_nightly(directory, site_id, enabled, user):
     """Atomic, root:sitewatch 0640 so the dashboard can show the switches."""
+    import fcntl
     import grp
-    sites = read_nightly(directory)
-    sites[site_id] = {"enabled": enabled, "changed_at": utcnow(), "by": user}
+    with (directory / ".nightly.lock").open("a") as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX)  # two switches at once must not lose one
+        sites = read_nightly(directory)
+        sites[site_id] = {"enabled": enabled, "changed_at": utcnow(), "by": user}
+        replace_nightly(directory, sites, grp.getgrnam("sitewatch").gr_gid)
+    return sites[site_id]
+
+
+def replace_nightly(directory, sites, group):
     fd, name = tempfile.mkstemp(prefix=".nightly-", dir=directory)
     try:
         with os.fdopen(fd, "w", encoding="utf-8") as stream:
             os.fchmod(stream.fileno(), 0o640)
-            os.fchown(stream.fileno(), 0, grp.getgrnam("sitewatch").gr_gid)
+            os.fchown(stream.fileno(), 0, group)
             json.dump({"sites": sites}, stream, indent=2)
             stream.write("\n")
         os.replace(name, directory / NIGHTLY_NAME)
     finally:
         if os.path.exists(name):
             os.unlink(name)
-    return sites[site_id]
 
 
 def run_items(updater, items, user, say, results):
@@ -589,14 +613,22 @@ def load_inventory(site):
     return inventory
 
 
-def nightly_run(config, say, results):
+def skipped(site, reason, user):
+    """A nightly site that could not be updated at all, as a log item the dashboard shows."""
+    return {"time": utcnow(), "site": site["id"], "kind": "all", "slug": None, "source": None, "from": None, "to": None,
+            "result": "refused", "message": f"Nightly run skipped this site: {reason}", "backup": None, "seconds": 0, "user": user}
+
+
+def nightly_run(config, say, results, user="nightly"):
     """Timer job: every site whose nightly switch is on gets its plugin, theme and WordPress minor
-    updates, each with backup, health check and rollback. Runs the collector first."""
+    updates, each with backup, health check and rollback. Runs the collector first. Returns the
+    number of sites that had to be skipped, so the service can fail visibly."""
     policy = read_nightly()
     sites = [s for s in config["sites"] if s.get("kind", "wordpress") == "wordpress" and policy.get(s["id"], {}).get("enabled")]
     if not sites:
         say("No site has nightly updates switched on.")
-        return
+        return 0
+    skipped_sites = 0
     try:
         with signals_held():
             execute(["/usr/bin/systemctl", "start", "site-collect.service"], timeout=40 * 60)
@@ -609,14 +641,22 @@ def nightly_run(config, say, results):
                 collector.validate_owner(site)
                 updater = Updater(site, load_inventory(site), say=say)
             except (ValueError, OSError, KeyError, CheckFailed) as exc:
-                say(f"{site['id']}: skipped ({exc if isinstance(exc, ValueError) else 'setup problem'})")
+                item = skipped(site, str(exc) if isinstance(exc, ValueError) else "setup problem (owner, path or inventory)", user)
+                try:
+                    append_log(STATE_DIR, [item])
+                except (OSError, KeyError, ValueError):
+                    pass
+                say(describe(item))
+                skipped_sites += 1
                 continue
+            updater.core_minor_only = True
             items = updater.pending(core_minor=True)
             if not items:
                 say(f"{site['id']}: nothing to update.")
-            run_items(updater, items, "nightly", say, results)
+            run_items(updater, items, user, say, results)
             if updater.interrupted or STOP["requested"]:
                 break
+    return skipped_sites
 
 
 def describe(r):
@@ -645,6 +685,9 @@ def main(argv=None):
             parser.error("nightly takes on or off")
     elif (args.kind in ("plugin", "theme")) != (args.slug is not None) or (args.slug and not SLUG.fullmatch(args.slug)):
         parser.error("plugin and theme need one valid slug; core, translations and all take none")
+    elif args.files_only_rollback and args.kind == "core":
+        # core update-db upgrades the database; old core files on a newer database are not a rollback.
+        parser.error("a WordPress core rollback always restores the database")
     if os.name != "posix" or os.geteuid() != 0:
         parser.error("site-update must run as root on Linux, through sudo")
     say = quietly((lambda *_: None) if args.json else lambda *a: print(*a, flush=True))
@@ -655,12 +698,13 @@ def main(argv=None):
     signal.signal(signal.SIGINT, interrupt)
     sudo_user = os.environ.get("SUDO_USER", "")
     user = sudo_user if re.fullmatch(r"[a-z_][a-z0-9_-]{0,31}", sudo_user) else "root"
-    results = []
+    results, skipped_sites = [], 0
     try:
         config = collector.load_config(CONFIG)
         if args.nightly_run:
             private_directory(BACKUP_ROOT)
-            nightly_run(config, say, results)
+            # Started by hand through sudo: log who did it, not "nightly".
+            skipped_sites = nightly_run(config, say, results, user if sudo_user else "nightly")
         else:
             site = next((s for s in config["sites"] if s["id"] == args.site), None)
             if site is None or site.get("kind", "wordpress") != "wordpress":
@@ -701,7 +745,7 @@ def main(argv=None):
             print(json.dumps({"results": results}))
         except (OSError, ValueError):
             pass  # the dashboard gave up; every item is in the update log
-    return max([EXIT_CODES.get(r["result"], 4) for r in results] or [0])
+    return max([EXIT_CODES.get(r["result"], 4) for r in results] + [1 if skipped_sites else 0])
 
 
 if __name__ == "__main__":

@@ -11,6 +11,10 @@ ExecStart=/usr/local/sbin/site-update --nightly-run
 UMask=0027
 # Collector run, then each update with backup, check and possible rollback.
 TimeoutStartSec=4h
+# On stop or reboot, SIGTERM goes to site-update only; it stops the running command itself and
+# finishes any rollback. Everything is killed only after TimeoutStopSec (longest rollback + margin).
+KillMode=mixed
+TimeoutStopSec=45min
 PrivateTmp=true
 ProtectSystem=full
 ProtectKernelTunables=true

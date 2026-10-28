@@ -129,6 +129,10 @@ class TransportTests(unittest.TestCase):
         history, nightly = transport.fetch_server_state(config)
         self.assertEqual(len(history), 1)
         self.assertEqual(nightly, {"example.org": {"enabled": True, "by": "darius"}})
+        run.return_value = subprocess.CompletedProcess([], 0, transport.NIGHTLY_MARK.encode() + b"\n", b"")
+        self.assertIsNone(transport.fetch_server_state(config)[1])  # unreadable switch file: unknown, not off
+        run.return_value = subprocess.CompletedProcess([], 0, transport.NIGHTLY_MARK.encode() + b"\n{}\n", b"")
+        self.assertEqual(transport.fetch_server_state(config)[1], {})
 
     def test_rollback_choice_and_nightly_commands(self):
         config = {"host": "example.org", "user": "darius", "port": 5567}
@@ -144,6 +148,20 @@ class TransportTests(unittest.TestCase):
 
 
 class CollectorTests(unittest.TestCase):
+    @patch("sitewatch.collector.origin_health", return_value={"path": "/", "ok": True, "status": 200})
+    @patch("sitewatch.collector.security_flags", return_value={})
+    @patch("sitewatch.collector.wp")
+    def test_core_reports_the_installed_branch_release(self, wp, *_):
+        def answer(site, *args):
+            if args[:2] == ("core", "version"):
+                return "6.8.2"
+            if args[:2] == ("core", "check-update"):
+                return json.dumps([{"version": "7.0.1", "update_type": "major"}, {"version": "6.8.3", "update_type": "minor"}])
+            return "[]"
+        wp.side_effect = answer
+        core = collector.collect_site({"id": "example.org", "kind": "wordpress", "origin_ip": "203.0.113.10"}, {}, {})["core"]
+        self.assertEqual((core["update_version"], core["minor_update_version"]), ("7.0.1", "6.8.3"))
+
     @patch("sitewatch.collector.run", return_value="6.8.2")
     @patch("sitewatch.collector.validate_owner")
     def test_wp_always_drops_privileges(self, validate, run):

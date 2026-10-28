@@ -84,7 +84,8 @@ function itemLabel(r) { return r.kind === 'core' ? 'WordPress core' : r.kind ===
 function showBanner(text, error) { $('banner').textContent = text; $('banner').hidden = false; $('banner').classList.toggle('error', error); $('banner').scrollIntoView({block: 'nearest', behavior: 'smooth'}); }
 async function runUpdate(site, item) {
   const what = item.type === 'core' ? 'WordPress core' : item.name;
-  const answer = await ask({title: `Update ${what} on ${site.id}?`, ok: 'Update', option: true,
+  // Core always restores the database: update-db upgrades it, and old core files on it are no rollback.
+  const answer = await ask({title: `Update ${what} on ${site.id}?`, ok: 'Update', option: item.type !== 'core',
     text: `${item.version || '?'} → ${item.update_version}. A backup of its files and the database is taken first. If the site fails its health check afterwards, the backup is restored automatically.`});
   if (!answer) return;
   updating = true; renderUpdates();
@@ -118,17 +119,18 @@ function ask({title, text, ok, option = false}) {
 function nightlyOn(site) { return !!payload?.nightly?.[site.id]?.enabled; }
 function nightlyControl(site) {
   if (site.kind !== 'wordpress') return node('span', '—');
-  const on = nightlyOn(site);
-  if (!payload?.capabilities?.updates) return badge(on ? 'On' : 'Off', on ? 'good' : 'neutral');
-  const button = node('button', on ? 'On' : 'Off', `filter nightly-toggle${on ? ' on' : ''}`);
-  button.setAttribute('aria-pressed', String(on)); button.setAttribute('aria-label', `Nightly updates for ${site.id}: ${on ? 'on' : 'off'}`);
+  const on = nightlyOn(site), unknown = payload?.nightly == null;
+  const label = unknown ? 'Unknown' : on ? 'On' : 'Off';
+  if (!payload?.capabilities?.updates) return badge(label, on ? 'good' : unknown ? 'warn' : 'neutral');
+  const button = node('button', label, `filter nightly-toggle${on ? ' on' : ''}`);
+  button.setAttribute('aria-pressed', String(on)); button.setAttribute('aria-label', `Nightly updates for ${site.id}: ${label.toLowerCase()}`);
   button.addEventListener('click', e => { e.stopPropagation(); setNightly(site, !on); });
   return button;
 }
 async function setNightly(site, enabled) {
   const answer = await ask(enabled
     ? {title: `Turn on nightly updates for ${site.id}?`, ok: 'Turn on',
-       text: 'Every night at about 03:30–03:50 the plugin and theme updates for this site, and WordPress security releases of the installed version, are installed one at a time, each with a backup, a health check and automatic rollback. A new WordPress major version stays a manual update. Results appear under Recent updates.'}
+       text: 'Every night at about 03:30–03:50 the plugin and theme updates for this site, and new releases of the installed WordPress branch (for example 6.8.2 to 6.8.3, which is how security fixes ship), are installed one at a time, each with a backup, a health check and automatic rollback. A new WordPress major version stays a manual update. Results appear under Recent updates.'}
     : {title: `Turn off nightly updates for ${site.id}?`, ok: 'Turn off', text: 'Updates for this site will only run when you press Update.'});
   if (!answer) return;
   try {
@@ -180,7 +182,7 @@ function showDetail(site) {
   body.append(flags);
   if (site.kind === 'wordpress') {
     const setting = payload?.nightly?.[site.id];
-    body.append(node('p', setting?.enabled ? `Nightly updates are on (since ${date(setting.changed_at)}${setting.by ? `, ${setting.by}` : ''}).` : 'Nightly updates are off.', 'detail-note'));
+    body.append(node('p', payload?.nightly == null ? 'Nightly updates: unknown (the switch file could not be read).' : setting?.enabled ? `Nightly updates are on (since ${date(setting.changed_at)}${setting.by ? `, ${setting.by}` : ''}).` : 'Nightly updates are off.', 'detail-note'));
   }
   body.append(node('h3', 'Origin checks'));
   for (const h of site.health || []) {const row = node('div', undefined, 'update-item'); row.append(node('span', h.path), badge(`${h.status || 'Failed'} · ${h.response_ms ?? '—'} ms`, h.ok ? 'good' : 'bad')); body.append(row);}

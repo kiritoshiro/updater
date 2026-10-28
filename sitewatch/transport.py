@@ -132,8 +132,10 @@ NIGHTLY_MARK = "--- site-watch nightly ---"
 
 def fetch_server_state(config, limit=50):
     """(recent update log items, newest first; nightly switches) in one fixed SSH read."""
-    remote = (f"tail -n {int(limit)} /var/lib/site-watch/update-log.jsonl 2>/dev/null; "
-              f"echo '{NIGHTLY_MARK}'; cat /var/lib/site-watch/nightly.json 2>/dev/null; true")
+    # A missing switch file means every switch is off; an unreadable one means unknown (None).
+    remote = (f"tail -n {int(limit)} /var/lib/site-watch/update-log.jsonl 2>/dev/null; echo '{NIGHTLY_MARK}'; "
+              "if [ -e /var/lib/site-watch/nightly.json ]; then cat /var/lib/site-watch/nightly.json 2>/dev/null; "
+              "else echo '{}'; fi; true")
     try:
         result = subprocess.run(ssh_command(config, remote), capture_output=True, timeout=25, check=False)
     except (OSError, subprocess.TimeoutExpired) as exc:
@@ -148,9 +150,9 @@ def fetch_server_state(config, limit=50):
         except ValueError:
             continue
     try:
-        switches = clean_nightly(json.loads(nightly)) if nightly.strip() else {}
+        switches = clean_nightly(json.loads(nightly))
     except ValueError:
-        switches = {}
+        switches = None
     return items[::-1], switches
 
 

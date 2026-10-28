@@ -24,7 +24,7 @@ class State:
         self.data = None
         self.error = None
         self.history = []
-        self.nightly = {}
+        self.nightly = None  # None: not read yet or unreadable, shown as unknown
         self.token = secrets.token_urlsafe(32)
         self.lock = threading.Lock()
         self.update_lock = threading.Lock()
@@ -89,7 +89,7 @@ class State:
         if not any(s["id"] == request["site"] and s["kind"] == "wordpress" for s in self.data["sites"]):
             raise ValueError("Unknown WordPress site")
         setting = self.updates.set_nightly(request["site"], request["enabled"])
-        self.nightly = {**self.nightly, request["site"]: setting}
+        self.nightly = {**(self.nightly or {}), request["site"]: setting}
         return setting
 
 

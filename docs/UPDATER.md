@@ -27,9 +27,16 @@ about 03:30–03:50. For every site that is switched on it:
 
 1. runs the collector, so the inventory is fresh;
 2. updates every reported plugin and theme, then a WordPress release of the installed x.y branch
-   (how WordPress ships security fixes), one at a time, each exactly as a manual update: backup,
-   health check, automatic rollback (database included);
+   (how WordPress ships security fixes; `wp core update --minor`, and a move to another branch is
+   treated as a failed update), one at a time, each exactly as a manual update: backup, health check,
+   automatic rollback (database included);
 3. stops for that site at the first update that is refused or rolled back, and goes on with the next site.
+
+A site that cannot be updated at all (stale inventory, owner or path problem) is logged as a skipped
+item and makes the service end as failed, so the dashboard's failed-units line shows it. A run started
+by hand (`sudo site-update --nightly-run`) is logged under that user, not `nightly`. On stop or
+reboot, only site-update gets SIGTERM (`KillMode=mixed`); it stops the running command and finishes any
+rollback within `TimeoutStopSec=45min`.
 
 A new WordPress major version (for example 6.9 to 7.0) is never installed at night. Results are in the
 update log with user `nightly`, shown under Recent updates. With `DISALLOW_FILE_MODS` on, WordPress's
@@ -99,7 +106,8 @@ Exit codes: 0 updated or nothing to change, 1 setup problem, 2 refused (nothing 
   backup and the rollback (normally a minute or two: comments, form entries, orders) is lost.
   Restoring was chosen over keeping a database that a failed plugin version may have migrated.
   Per update, the dashboard's checkbox (or `--files-only-rollback`) restores only the files and
-  leaves the database as it is; the database backup is still taken.
+  leaves the database as it is; the database backup is still taken. Not offered for WordPress core:
+  `core update-db` upgrades the database, so a core rollback always restores it.
 - A core rollback restores `wp-admin`, `wp-includes` and the root PHP files. Anything a core update
   adds under `wp-content` (for example a new bundled theme) stays.
 - The health check cannot see a page cache, and relies on PHP noticing changed files. Server 561363
