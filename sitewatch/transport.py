@@ -74,8 +74,9 @@ def clean_result(item):
 def run_update(config, site, kind, slug=None):
     """Run one validated update over SSH; returns cleaned results or raises ValueError."""
     try:
-        # The server waits at most 5 minutes for another update, then backup, update, check and rollback.
-        result = subprocess.run(update_command(config, site, kind, slug), capture_output=True, timeout=75 * 60, check=False)
+        # The server waits at most 5 minutes for another update; backup, core update, check and rollback
+        # are bounded by their own command limits (about 90 minutes in the worst case).
+        result = subprocess.run(update_command(config, site, kind, slug), capture_output=True, timeout=120 * 60, check=False)
     except (OSError, subprocess.TimeoutExpired) as exc:
         raise ValueError("The update did not report back. Check the update log before trying again.") from exc
     try:

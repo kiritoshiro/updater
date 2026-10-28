@@ -91,9 +91,9 @@ update $SITE plugin adventistai-cookie-consent >/dev/null 2>&1; code=$?
 check "second run refused: no update in inventory (exit $code)" test $code -eq 2
 
 echo "== signals: SIGTERM after the backup rolls back, SIGHUP is ignored"
-backed_up() {  # wait until this run's backup tar exists (newer than the marker touched before the run)
+backed_up() {  # wait until this run's backup is complete (backup.json is written last)
   for _ in $(seq 1 240); do
-    [ -n "$(find /var/backups/site-update/$SITE -maxdepth 2 -name files.tar -newer "$1" 2>/dev/null)" ] && return 0
+    [ -n "$(find /var/backups/site-update/$SITE -maxdepth 2 -name backup.json -newer "$1" 2>/dev/null)" ] && return 0
     sleep 0.25
   done
   return 1
@@ -108,6 +108,7 @@ check "SIGTERM: rolled back (exit $code)" test $code -eq 3 -a "$(last result)" =
 check "SIGTERM: logged as interrupted" bash -c "tail -n 1 $LOG | grep -q interrupted"
 check "SIGTERM: akismet back at 5.3.6" test "$(wpv plugin get akismet --field=version)" = "5.3.6"
 check "SIGTERM: front page 200, no maintenance file" test "$(front)" = 200 -a ! -e "$ROOT/.maintenance"
+check "SIGTERM: no WP-CLI process left running" bash -c "! pgrep -u site1 -f /usr/local/bin/wp >/dev/null"
 touch /tmp/hup.mark; sleep 1
 update $SITE theme twentytwentythree > /tmp/hup.out 2>&1 & p=$!
 # A hangup reaches the dashboard user's sudo and site-update, not the commands site-update starts.
@@ -118,6 +119,18 @@ check "SIGHUP sent to sudo and site-update after the backup" test $sent = yes
 check "SIGHUP to sudo and site-update: update finished (exit $code)" test $code -eq 0 -a "$(last result)" = updated
 check "SIGHUP: twentytwentythree updated to $(wpv theme get twentytwentythree --field=version)" \
   test "$(wpv theme get twentytwentythree --field=version)" != "1.6"
+
+# A real terminal hangup, like a dropped SSH session: run under script(1)'s pseudo-terminal and kill
+# the terminal mid-update. sudo uses its own pseudo-terminal (use_pty), as on Ubuntu 24.04.
+touch /tmp/pty.mark; sleep 1
+runuser -u darius -- script -qfec "sudo /usr/local/sbin/site-update $SITE plugin akismet" /dev/null >/dev/null 2>&1 &
+sent=no; backed_up /tmp/pty.mark && pkill -KILL -x script && sent=yes
+for _ in $(seq 1 240); do updater_pid >/dev/null || break; sleep 0.5; done
+check "terminal hangup sent after the backup" test $sent = yes
+check "terminal hangup: update finished and logged ($(last result))" test "$(last result)" = updated -a "$(last slug)" = akismet
+check "terminal hangup: akismet at $(wpv plugin get akismet --field=version)" test "$(wpv plugin get akismet --field=version)" != "5.3.6"
+check "terminal hangup: site 200, no maintenance file, no WP-CLI left" \
+  bash -c "test \"\$(curl -s -o /dev/null -w '%{http_code}' --resolve $SITE:443:127.0.0.1 --cacert /etc/site-watch/test-ca.pem https://$SITE/)\" = 200 -a ! -e $ROOT/.maintenance && ! pgrep -u site1 -f /usr/local/bin/wp >/dev/null"
 
 echo "== core: a broken update rolls back, then a good one"
 breaks "core::6.7.2"

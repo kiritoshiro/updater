@@ -31,6 +31,11 @@ PLUGIN = {"cookie/": "", "cookie/cookie.php": "<?php\n/*\n * Plugin Name: Cookie
 
 
 class ArchiveTests(unittest.TestCase):
+    def test_oversized_archive_refused_before_reading(self):
+        data, digest = archive(PLUGIN)
+        with patch.object(updater, "MAX_UNZIPPED_BYTES", 10), self.assertRaises(Refused):
+            check_archive(data, digest, "plugin", "cookie", "1.0.17")
+
     def test_valid_plugin_and_theme(self):
         data, digest = archive(PLUGIN)
         check_archive(data, digest, "plugin", "cookie", "1.0.17")
@@ -195,15 +200,13 @@ class UpdateFlowTests(unittest.TestCase):
             self.skipTest("symlinks unavailable")
         self.assertEqual(self.updater(FakeSite(None)).update("plugin", "classic")["result"], "refused")
 
-    def failing_after_backup(self, error, where="apply"):
+    def failing_after_backup(self, error):
+        """The update command raises `error` (the backup has been taken by then)."""
         fake = FakeSite(None)
         updater_ = self.updater(fake)
-        original = getattr(updater_, where)
         def broken(*args, **kwargs):
-            if where != "apply":
-                original(*args, **kwargs)
             raise error
-        setattr(updater_, where, broken)
+        updater_.apply = broken
         return updater_, fake
 
     def test_interrupt_after_backup_rolls_back(self):
@@ -215,7 +218,9 @@ class UpdateFlowTests(unittest.TestCase):
         self.assertTrue(fake.ran("db", "import", "-"))
 
     def test_unexpected_error_after_backup_rolls_back(self):
-        updater_, fake = self.failing_after_backup(RuntimeError("boom"), where="version")
+        fake = FakeSite(None)
+        updater_ = self.updater(fake)
+        # Reading the version works before the update and crashes after it.
         updater_.version = lambda *a: (_ for _ in ()).throw(RuntimeError("boom")) if fake.version == "1.1" else fake.version
         result = updater_.update("plugin", "classic")
         self.assertEqual(result["result"], "rolled_back")
@@ -295,17 +300,55 @@ class SignalTests(unittest.TestCase):
     def tearDown(self):
         updater.STOP.update(held=0, requested=False)
 
-    def test_interrupt_waits_while_restoring(self):
-        with updater.signals_held():
-            updater.interrupt()  # must not raise inside a restore or log write
+    def test_signal_only_sets_a_flag(self):
+        updater.interrupt()
+        updater.interrupt()  # a second Ctrl+C must not raise either
         self.assertTrue(updater.STOP["requested"])
+        with updater.signals_held():
+            updater.stop_requested()  # held: a restore keeps running
         with self.assertRaises(KeyboardInterrupt):
-            updater.interrupt()
+            updater.stop_requested()
 
-    def test_oversized_archive_refused_before_reading(self):
-        data, digest = archive(PLUGIN)
-        with patch.object(updater, "MAX_UNZIPPED_BYTES", 10), self.assertRaises(Refused):
-            check_archive(data, digest, "plugin", "cookie", "1.0.17")
+    @unittest.skipUnless(os.name == "posix", "real child process")
+    def test_running_command_is_stopped_and_waited_for(self):
+        import threading
+        threading.Timer(0.5, updater.interrupt).start()
+        started = time.monotonic()
+        with patch.object(updater.collector, "ENV", {"PATH": "/usr/bin:/bin"}), patch.object(updater, "stop", wraps=updater.stop) as stop:
+            with self.assertRaises(KeyboardInterrupt):
+                updater.execute(["/bin/sleep", "30"], timeout=60)
+        self.assertLess(time.monotonic() - started, 10)
+        self.assertIsNotNone(stop.call_args[0][0].returncode)  # waited: the child has exited
+
+    @unittest.skipUnless(os.name == "posix", "real child process")
+    def test_held_command_finishes(self):
+        updater.interrupt()
+        with updater.signals_held():
+            self.assertEqual(updater.execute(["/bin/echo", "done"], timeout=10), "done")
+
+    def test_interrupt_after_backup_with_failing_output_still_rolls_back(self):
+        # A second signal during the rollback must not stop it: only the flag is set.
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "site/wp-content/plugins/classic").mkdir(parents=True)
+            (root / "backups").mkdir()
+            site = {"id": "example.org", "owner": "example", "path": str(root / "site"), "origin_ip": "203.0.113.10", "ca_file": None, "github": {}}
+            inventory = {"plugins": [{"name": "classic", "version": "1.0", "update_version": "1.1"}], "themes": []}
+            fake = FakeSite(None)
+            def run(argv, timeout=65, stdin=None, stdout=None):
+                args = argv[argv.index("--no-color") + 1:] if "--no-color" in argv else []
+                if args[:2] == ["plugin", "update"]:
+                    fake.version = "1.1"
+                    raise KeyboardInterrupt
+                if args[:2] == ["db", "import"]:
+                    updater.interrupt()  # another Ctrl+C while restoring
+                return fake(argv, timeout, stdin, stdout)
+            if not hasattr(os, "fchmod"):
+                self.skipTest("os.fchmod needs Unix or Python 3.13+")
+            result = Updater(site, inventory, run=run, health=lambda: [{"path": "/", "status": 200, "ok": True}],
+                             sleep=lambda _: None, backups=root / "backups", say=lambda *_: None).update("plugin", "classic")
+            self.assertEqual((result["result"], result["to"]), ("rolled_back", "1.0"))
+            self.assertIn("interrupted", result["message"])
 
 
 class CommandLineTests(unittest.TestCase):

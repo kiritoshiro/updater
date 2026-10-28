@@ -47,6 +47,7 @@ SETTLE_SECONDS = 3  # PHP's opcache rechecks changed files every 2 s by default
 LOCK_WAIT, DASHBOARD_LOCK_WAIT = 20 * 60, 5 * 60
 MAX_INVENTORY_AGE = 3 * 3600
 EXIT_CODES = {"updated": 0, "unchanged": 0, "refused": 2, "rolled_back": 3, "rollback_failed": 4}
+RESULTS = tuple(EXIT_CODES)
 CORE_FILES = re.compile(r"(?!wp-config\.php\Z)[a-z0-9-]+\.php\Z|license\.txt\Z|readme\.html\Z|wp-admin\Z|wp-includes\Z")
 DIGEST = re.compile(r"sha256:([0-9a-f]{64})\Z")
 VERSION_HEADER = re.compile(rb"^[ \t/*#@]*Version:[ \t]*([0-9][0-9a-zA-Z.+-]*)", re.MULTILINE | re.IGNORECASE)
@@ -60,15 +61,25 @@ class Refused(Exception):
 
 def execute(argv, timeout=65, stdin=None, stdout=None):
     """Run a fixed argv. Output is never shown or logged: a failing site may print secrets.
-    Commands run in their own session, so a terminal hangup or Ctrl+C reaches only site-update,
-    which then stops them in order and waits before it restores anything."""
+    Commands run in their own session, so a terminal hangup or Ctrl+C reaches only site-update.
+    A stop request (see interrupt) is taken here and only here: the command is stopped and waited
+    for, then KeyboardInterrupt is raised at this known point, unless a restore is running."""
+    stop_requested()
     try:
         proc = subprocess.Popen(argv, stdin=stdin or subprocess.DEVNULL, stdout=stdout or subprocess.PIPE,
                                 stderr=subprocess.DEVNULL, env=collector.ENV, cwd="/", start_new_session=os.name == "posix")
     except OSError as exc:
         raise CheckFailed("Command unavailable") from exc
+    deadline = time.monotonic() + timeout
     try:
-        output, _ = proc.communicate(timeout=timeout)
+        while True:
+            try:
+                output, _ = proc.communicate(timeout=max(0.1, min(1, deadline - time.monotonic())))
+                break
+            except subprocess.TimeoutExpired:
+                if time.monotonic() >= deadline:
+                    raise
+                stop_requested()
     except BaseException as exc:
         stop(proc)
         if isinstance(exc, subprocess.TimeoutExpired):
@@ -321,6 +332,7 @@ class Updater:
             archive = self.prepare_release(kind, slug) if result["source"] == "github" else None
             label = f"{time.strftime('%Y%m%d-%H%M%S')}-{kind}" + (f"-{slug}" if slug else "")
             directory, folder, names = self.backup(kind, slug, label)
+            self.last_backup = (directory, folder, names)
             result["backup"] = str(directory)
             try:
                 self.change(kind, slug, archive, result)
@@ -337,9 +349,13 @@ class Updater:
         except Refused as exc:
             result["message"] = str(exc)
         except BaseException as exc:
-            # Before the backup nothing on the site has changed yet.
             self.interrupted = self.interrupted or not isinstance(exc, Exception)
-            result["message"] = ("Interrupted" if self.interrupted else "Stopped on an unexpected error") + " before anything was changed"
+            reason = "Interrupted" if self.interrupted else "Stopped on an unexpected error"
+            if result["backup"] and result["result"] not in RESULTS:
+                # Defensive: something escaped after the backup; put the site back.
+                result.update(self.rollback(*self.last_backup, kind, slug, result["from"], reason))
+            elif not result["backup"]:
+                result["message"] = reason + " before anything was changed"
         result["seconds"] = round(time.monotonic() - started)
         return result
 
@@ -413,9 +429,14 @@ STOP = {"held": 0, "requested": False}
 
 
 def interrupt(*_):
-    """Ctrl+C and SIGTERM: stop now, unless a restore or log write is running; then stop after it."""
+    """Ctrl+C and SIGTERM only set a flag. The update stops at the next safe point, the running
+    command (execute), and is rolled back if the backup exists. Python code is never interrupted
+    halfway, so a result cannot be lost or mislabelled."""
     STOP["requested"] = True
-    if not STOP["held"]:
+
+
+def stop_requested():
+    if STOP["requested"] and not STOP["held"]:
         raise KeyboardInterrupt
 
 
@@ -465,6 +486,7 @@ def update_lock(directory, say=print, wait=LOCK_WAIT):
                     say("Waiting for another update to finish…")
                     waiting = True
                 time.sleep(2)
+                stop_requested()
         yield
 
 
@@ -514,7 +536,8 @@ def main(argv=None):
     if os.name != "posix" or os.geteuid() != 0:
         parser.error("site-update must run as root on Linux, through sudo")
     say = quietly((lambda *_: None) if args.json else lambda *a: print(*a, flush=True))
-    # A dropped SSH session must not stop an update halfway; SIGTERM rolls back like Ctrl+C.
+    # A dropped SSH session must not stop an update halfway; SIGTERM and Ctrl+C stop it at the next
+    # safe point and roll back.
     signal.signal(signal.SIGHUP, signal.SIG_IGN)
     signal.signal(signal.SIGTERM, interrupt)
     signal.signal(signal.SIGINT, interrupt)
@@ -539,8 +562,10 @@ def main(argv=None):
             for kind, slug in updater.pending() if args.kind == "all" else [(args.kind, args.slug)]:
                 result = updater.update(kind, slug)
                 result["user"] = user if re.fullmatch(r"[a-z_][a-z0-9_-]{0,31}", user) else "root"
-                with signals_held():
+                try:
                     append_log(STATE_DIR, [result])  # each item as soon as it is done
+                except (OSError, KeyError):
+                    result["message"] += ". The update log could not be written"
                 results.append(result)
                 say(describe(result))
                 if result["result"] not in ("updated", "unchanged") or updater.interrupted or STOP["requested"]:
@@ -549,7 +574,8 @@ def main(argv=None):
                 say("No plugin or theme updates in the last inventory.")
         if any(r["result"] in ("updated", "rolled_back", "rollback_failed") for r in results):
             try:  # refresh the dashboard's inventory in the background
-                execute(["/usr/bin/systemctl", "start", "--no-block", "site-collect.service"], timeout=30)
+                with signals_held():
+                    execute(["/usr/bin/systemctl", "start", "--no-block", "site-collect.service"], timeout=30)
             except CheckFailed:
                 pass
     except (ValueError, OSError, KeyError, CheckFailed, KeyboardInterrupt) as exc:
@@ -563,8 +589,11 @@ def main(argv=None):
             pass
         return 1
     if args.json:
-        print(json.dumps({"results": results}))
-    return max([EXIT_CODES[r["result"]] for r in results] or [0])
+        try:
+            print(json.dumps({"results": results}))
+        except (OSError, ValueError):
+            pass  # the dashboard gave up; every item is in the update log
+    return max([EXIT_CODES.get(r["result"], 4) for r in results] or [0])
 
 
 if __name__ == "__main__":

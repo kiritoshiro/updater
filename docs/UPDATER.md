@@ -23,8 +23,8 @@ Exit codes: 0 updated or nothing to change, 1 setup problem, 2 refused (nothing 
    that plugin, theme or core. Slugs must match `[a-zA-Z0-9][a-zA-Z0-9_.-]*`. Anything else is
    refused before anything runs. Translations need no inventory entry.
 2. **Waits its turn.** One update at a time across all sites (`/var/lib/site-watch/.update.lock`);
-   a second request waits up to 20 minutes (5 minutes when the dashboard asks, so its request
-   finishes within its 75-minute limit).
+   a second request waits up to 20 minutes (5 minutes when the dashboard asks; the dashboard waits
+   up to 2 hours for a reply, more than the slowest possible core update with rollback).
 3. **Checks the site first.** The origin health check (the collector's `health_paths`, through
    `curl --resolve` past Cloudflare) must pass. An already-broken site is refused, because a
    later failure could not be blamed on the update.
@@ -50,8 +50,10 @@ Exit codes: 0 updated or nothing to change, 1 setup problem, 2 refused (nothing 
    `wp-admin` and `wp-includes`; `languages`), unpacks the backup, imports the database backup,
    leaves maintenance mode, then checks health and the version again. The result is `rolled_back`
    only if the site is healthy and back at its old version; otherwise `rollback_failed` with the
-   backup path. A signal that arrives while a restore or log write is running takes effect after it.
-   SIGHUP is ignored, so a dropped SSH session does not stop an update halfway.
+   backup path. Ctrl+C and SIGTERM only set a flag: the running command is stopped (SIGTERM through
+   sudo and `timeout` to WP-CLI, then waited for) and the rollback follows; a signal during a
+   restore waits until it is done. SIGHUP is ignored, so a dropped SSH session does not stop an
+   update halfway. For long manual runs, a `tmux` session is still the safer habit.
 10. **Logs** one JSON line per item as soon as it is done to `/var/lib/site-watch/update-log.jsonl`
     (root:sitewatch 0640, last 1,000): time, sudo user, site, item, source, versions, result,
     message and backup path. No command output is logged or shown: a broken site may print secrets.
@@ -76,8 +78,9 @@ Exit codes: 0 updated or nothing to change, 1 setup problem, 2 refused (nothing 
   chosen over keeping a database that a failed plugin version may have migrated.
 - A core rollback restores `wp-admin`, `wp-includes` and the root PHP files. Anything a core update
   adds under `wp-content` (for example a new bundled theme) stays.
-- The health check cannot see a page cache. Server 561363 has none in nginx and no page-cache
-  plugin (checked 2026-10-28); re-check this before enabling updates elsewhere.
+- The health check cannot see a page cache, and relies on PHP noticing changed files. Server 561363
+  has no nginx cache, no page-cache plugin, and opcache with `validate_timestamps` on and
+  `revalidate_freq` 2 (checked 2026-10-28); re-check this before enabling updates elsewhere.
 - Only the latest GitHub release is installed, and only public repositories are supported.
   Vendor plugins with their own updaters are not updated (their updaters are skipped).
 - The health check sees fatal errors and error statuses on the checked paths only. Add an archive page to a
