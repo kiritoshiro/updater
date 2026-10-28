@@ -1,5 +1,6 @@
 {
   "host": "your-server",
   "user": "your-user",
-  "port": 22
+  "port": 22,
+  "updates": false
 }

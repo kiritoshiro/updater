@@ -94,6 +94,37 @@ class TransportTests(unittest.TestCase):
             fetch_ssh({"host": "example.org", "user": "darius"})
         self.assertNotIn("secret", str(error.exception))
 
+    def test_update_command_is_fixed_and_validated(self):
+        config = {"host": "example.org", "user": "darius", "port": 5567}
+        self.assertEqual(transport.update_command(config, "example.org", "plugin", "classic-editor")[-1],
+                         "sudo -n /usr/local/sbin/site-update --json example.org plugin classic-editor")
+        self.assertEqual(transport.update_command(config, "example.org", "core")[-1],
+                         "sudo -n /usr/local/sbin/site-update --json example.org core")
+        for args in (("example.org", "plugin", "x;id"), ("example.org", "plugin", "$(id)"), ("example.org", "plugin", "-x"),
+                     ("example.org", "plugin", None), ("example.org", "core", "x"), ("example.org", "all", None),
+                     ("a b", "core", None), ("example.org;id", "core", None)):
+            with self.subTest(args=args), self.assertRaises(ValueError):
+                transport.update_command(config, *args)
+
+    @patch("sitewatch.transport.subprocess.run")
+    def test_update_reply_is_cleaned(self, run):
+        config = {"host": "example.org", "user": "darius"}
+        reply = {"results": [{"site": "example.org", "kind": "plugin", "slug": "x", "result": "rolled_back",
+                              "message": "m" * 1000, "backup": "/var/backups/x", "extra": "<script>"}]}
+        run.return_value = subprocess.CompletedProcess([], 3, ("Waiting…\n" + json.dumps(reply)).encode(), b"")
+        [result] = transport.run_update(config, "example.org", "plugin", "x")
+        self.assertEqual((result["result"], len(result["message"])), ("rolled_back", 300))
+        self.assertNotIn("extra", result)
+        run.return_value = subprocess.CompletedProcess([], 1, b"", b"sudo: a password is required")
+        with self.assertRaises(ValueError) as error:
+            transport.run_update(config, "example.org", "plugin", "x")
+        self.assertIn("sudoers", str(error.exception))
+        run.return_value = subprocess.CompletedProcess([], 1, b'{"error": "Another update is still running; try again later"}', b"")
+        with self.assertRaises(ValueError):
+            transport.run_update(config, "example.org", "plugin", "x")
+        run.return_value = subprocess.CompletedProcess([], 0, b'{"result": "updated"}\nnot json\n{"result": "bad"}\n', b"")
+        self.assertEqual(len(transport.fetch_update_log(config)), 1)
+
 
 class CollectorTests(unittest.TestCase):
     @patch("sitewatch.collector.run", return_value="6.8.2")
@@ -313,9 +344,54 @@ class ViewerTests(unittest.TestCase):
         headers = {"Origin": self.origin, "X-Site-Watch-Token": self.state.token}
         self.assertEqual(self.request("POST", "/api/refresh", headers)[0], 200)
 
-    def test_no_remote_update_endpoint(self):
-        headers = {"Origin": self.origin, "X-Site-Watch-Token": self.state.token}
-        self.assertEqual(self.request("POST", "/api/update", headers)[0], 404)
+    def post_update(self, body, origin=None):
+        raw = json.dumps(body).encode()
+        connection = http.client.HTTPConnection("127.0.0.1", self.server.server_port, timeout=3)
+        connection.request("POST", "/api/update", raw, {"Origin": origin or self.origin, "X-Site-Watch-Token": self.state.token,
+                                                         "Content-Type": "application/json", "Content-Length": str(len(raw))})
+        response = connection.getresponse()
+        code, reply = response.status, json.loads(response.read())
+        connection.close()
+        return code, reply
+
+    def enable_updates(self):
+        calls = []
+        live = sample(); live["demo"] = False
+        self.state.loader = lambda: live
+        self.state.updates = (lambda site, kind, slug: calls.append((site, kind, slug)) or [{"result": "updated"}], lambda: [])
+        self.state.refresh()
+        return calls
+
+    def test_read_only_dashboard_refuses_updates(self):
+        code, reply = self.post_update({"site": "adventistai.lt", "kind": "plugin", "slug": "wordfence"})
+        self.assertEqual(code, 400)
+        self.assertFalse(reply["capabilities"]["updates"])
+
+    def test_demo_data_never_offers_updates(self):
+        self.state.updates = (lambda *_: self.fail("must not run"), lambda: [])
+        self.assertFalse(self.state.payload()["capabilities"]["updates"])
+
+    def test_update_runs_only_reported_updates(self):
+        calls = self.enable_updates()
+        self.assertTrue(self.state.payload()["capabilities"]["updates"])
+        self.assertEqual(self.post_update({"site": "adventistai.lt", "kind": "plugin", "slug": "wordfence"})[0], 200)
+        self.assertEqual(self.post_update({"site": "dievozodis.lt", "kind": "core"})[0], 200)
+        for body in ({"site": "sveikas.info", "kind": "plugin", "slug": "wordfence"}, {"site": "adventistai.lt", "kind": "core"},
+                     {"site": "adventistai.lt", "kind": "plugin", "slug": "wordfence; id"}, {"site": "giesmynas.adventistai.lt", "kind": "core"},
+                     {"site": "adventistai.lt", "kind": "all"}, {"site": "adventistai.lt", "kind": "plugin", "slug": "wordfence", "extra": 1}):
+            with self.subTest(body=body):
+                self.assertEqual(self.post_update(body)[0], 400)
+        self.assertEqual(calls, [("adventistai.lt", "plugin", "wordfence"), ("dievozodis.lt", "core", None)])
+
+    def test_update_needs_same_origin_and_one_at_a_time(self):
+        calls = self.enable_updates()
+        self.assertEqual(self.post_update({"site": "dievozodis.lt", "kind": "core"}, origin="https://attacker.example")[0], 403)
+        self.state.update_lock.acquire()
+        try:
+            self.assertEqual(self.post_update({"site": "dievozodis.lt", "kind": "core"})[0], 409)
+        finally:
+            self.state.update_lock.release()
+        self.assertEqual(calls, [])
 
     def test_missing_and_stale_preserved_on_failure(self):
         previous = self.state.data

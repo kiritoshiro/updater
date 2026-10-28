@@ -2,7 +2,7 @@
 
 The root Linux collector invokes WP-CLI through `sudo -n -H -u <owner> -- timeout … wp --skip-plugins --skip-themes --skip-packages`. A failed WordPress call becomes a fixed public error message; stderr is never copied to status. Each site is isolated so one fatal installation does not abort fleet collection.
 
-The collector writes schema version 1 to `/var/lib/site-watch/status.json`. The app reads exactly this path with a fixed SSH command. Connection configuration is local and never supplied by the browser. The browser has only status and refresh endpoints. It has no arbitrary command or update endpoint.
+The collector writes schema version 1 to `/var/lib/site-watch/status.json`. The app reads exactly this path with a fixed SSH command. Connection configuration is local and never supplied by the browser. The browser has status and refresh endpoints and, when the viewer config enables updates, one update endpoint. It accepts only a site, kind and slug that the current snapshot reports as updatable; the viewer turns them into a fixed `sudo -n /usr/local/sbin/site-update --json <site> <kind> [<slug>]` SSH command after strict pattern checks. There is no arbitrary command endpoint.
 
 ## Contract
 
@@ -21,8 +21,8 @@ The viewer rejects unsupported schemas, invalid timestamps, duplicate site IDs a
 
 Root-owned config is validated independently of inventory. No credential or full WP option/config output is a contract field. A site's own Unix user remains a trust boundary: malicious must-use code can still run as that user, and an installed component can lie about its version. Planned file-integrity monitoring is separate from inventory.
 
-The future updater must derive permitted site roots and owners from root-owned configuration, never just from a potentially forged snapshot. It must validate requested slugs against a fresh inventory, serialize jobs, fail closed on stale/unknown checks, back up outside the site root, verify artifacts against a trusted digest and safely roll back before update controls are enabled. Database migrations need explicit rollback policy; restoring a database automatically can discard new content. None of these promises is presented as implemented by this release.
+The updater (`sitewatch/updater.py`, [UPDATER.md](UPDATER.md)) takes site roots and owners from the root-owned collector configuration, never from the snapshot. It accepts only updates the inventory reports (at most 3 hours old), serialises jobs with a lock, refuses sites that fail their health check beforehand, backs up outside the site root, verifies GitHub release ZIPs against GitHub's SHA-256 digest and rolls back automatically. Rollback policy for the database: it is restored, which discards content written during the update window (normally a minute or two). These properties are covered by unit tests and a disposable-WordPress acceptance suite; production installation is a separate step.
 
-Original requirements live in the Obsidian project notes “WP Site Watch — Dashboard and Updater Plan” and “WP Site Watch — Spec”. This repository starts with phases 1–2 of the dashboard plan; alerting parts A–C and the destructive updater are separate remaining milestones.
+Original requirements live in the Obsidian project notes “WP Site Watch — Dashboard and Updater Plan” and “WP Site Watch — Spec”. This repository implements phases 1–2 and 4 of the dashboard plan; alerting parts A–C and the extended statistics of phase 3 are separate milestones.
 
 WP-CLI behavior references: [plugin list](https://developer.wordpress.org/cli/commands/plugin/list/) and [core check-update](https://developer.wordpress.org/cli/commands/core/check-update/). The latter documents both `--force-check` and the fact that must-use plugins still load with `--skip-plugins`.

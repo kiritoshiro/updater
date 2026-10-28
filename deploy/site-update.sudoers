@@ -1,0 +1,3 @@
+# /etc/sudoers.d/site-update (root 0440; check with visudo -cf). Replace darius if another user
+# runs the dashboard. The wrapper validates every argument against the collector's inventory.
+darius ALL=(root) NOPASSWD: /usr/local/sbin/site-update

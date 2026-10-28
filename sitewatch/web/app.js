@@ -1,6 +1,6 @@
 'use strict';
 const $ = id => document.getElementById(id);
-let snapshot = null, payload = null, filter = 'all', query = '', currentView = 'overview';
+let snapshot = null, payload = null, filter = 'all', query = '', currentView = 'overview', updating = false;
 const node = (tag, text, className) => { const el = document.createElement(tag); if (text !== undefined) el.textContent = text; if (className) el.className = className; return el; };
 const badge = (text, kind = 'neutral') => node('span', text, `badge ${kind}`);
 const bytes = n => typeof n === 'number' ? `${(n / 1073741824).toFixed(1)} GB` : 'Unknown';
@@ -77,12 +77,52 @@ function renderServer() {
     }
   }
 }
+const RESULT_BADGES = {updated: ['Updated', 'good'], unchanged: ['No change', 'neutral'], refused: ['Refused', 'neutral'], rolled_back: ['Rolled back', 'warn'], rollback_failed: ['Rollback failed', 'bad']};
+function canUpdate(item) { return !!payload?.capabilities?.updates && ['plugin', 'theme', 'core'].includes(item.type); }
+function itemLabel(r) { return r.kind === 'core' ? 'WordPress core' : r.kind === 'translations' ? 'Translations' : r.slug; }
+function showBanner(text, error) { $('banner').textContent = text; $('banner').hidden = false; $('banner').classList.toggle('error', error); $('banner').scrollIntoView({block: 'nearest', behavior: 'smooth'}); }
+async function runUpdate(site, item) {
+  const what = item.type === 'core' ? 'WordPress core' : item.name;
+  if (!confirm(`Update ${what} on ${site.id} from ${item.version || '?'} to ${item.update_version}?\n\nA backup of its files and the database is taken first. If the site fails its health check afterwards, the backup is restored automatically.`)) return;
+  updating = true; renderUpdates();
+  showBanner(`Updating ${what} on ${site.id}. This can take a few minutes; keep this page open.`, false);
+  try {
+    const response = await fetch('/api/update', {method: 'POST', headers: {'Content-Type': 'application/json', 'X-Site-Watch-Token': payload.refresh_token},
+      body: JSON.stringify({site: site.id, kind: item.type, slug: item.type === 'core' ? null : item.name})});
+    const data = await response.json();
+    if ('status' in data) render(data);
+    const r = data.results?.[data.results.length - 1];
+    showBanner(r ? `${site.id} · ${what}: ${r.message}.${r.result === 'updated' ? ' The inventory refreshes within a minute.' : ''}` : data.error || 'The update request failed.', !r || !['updated', 'unchanged'].includes(r.result));
+  } catch (_) {
+    showBanner('The update request failed. Check the update log before trying again.', true);
+  } finally {
+    updating = false; renderUpdates(); setTimeout(() => load(true), 60000);
+  }
+}
+function renderHistory() {
+  const list = $('update-history'); list.replaceChildren();
+  const history = payload?.history || [];
+  $('history-panel').hidden = !payload?.capabilities?.updates && !history.length;
+  for (const r of history) {
+    const row = node('div', undefined, 'update-item'), name = node('div', itemLabel(r));
+    name.append(node('small', `${r.site} · ${date(r.time)} · ${r.user || 'unknown user'}`), node('small', r.message));
+    const [text, kind] = RESULT_BADGES[r.result] || [r.result, 'neutral'], side = node('div', undefined, 'update-actions');
+    if (r.from && r.to && r.from !== r.to) side.append(node('span', `${r.from} → ${r.to}`, 'version-change'));
+    side.append(badge(text, kind)); row.append(name, side); list.append(row);
+  }
+  if (!history.length) list.append(node('p', 'No updates have been run from Site Watch yet.', 'detail-note'));
+}
 function renderUpdates() {
   const list = $('update-list'); list.replaceChildren();
   for (const site of snapshot?.sites || []) for (const item of updates(site)) {
-    const row = node('div', undefined, 'update-item'), name = node('div', item.name);
+    const row = node('div', undefined, 'update-item'), name = node('div', item.name), side = node('div', undefined, 'update-actions');
     name.append(node('small', `${site.id} · ${item.type} · ${item.source || 'wordpress.org'}`));
-    row.append(name, node('span', `${item.version || '?'} → ${item.update_version}`, 'version-change')); list.append(row);
+    side.append(node('span', `${item.version || '?'} → ${item.update_version}`, 'version-change'));
+    if (canUpdate(item)) {
+      const button = node('button', 'Update', 'filter update-button'); button.disabled = updating || !!payload.update_running;
+      button.setAttribute('aria-label', `Update ${item.name} on ${site.id}`); button.addEventListener('click', () => runUpdate(site, item)); side.append(button);
+    }
+    row.append(name, side); list.append(row);
   }
   for (const item of serverUpdates(snapshot?.server)) {
     const row = node('div', undefined, 'update-item'), name = node('div', item.name);
@@ -125,7 +165,10 @@ function render(data) {
   if (data.error) messages.push(`${data.error}${snapshot ? ' Showing the last successful snapshot.' : ''}`);
   if (data.freshness?.stale) messages.push(data.freshness.clock_skew ? 'Snapshot time is in the future. Check the server clock.' : `Snapshot is stale since ${date(snapshot.collected_at)}. Refresh reads the latest file; it does not trigger the server collector.`);
   $('banner').textContent = messages.join(' '); $('banner').hidden = !messages.length; $('banner').classList.toggle('error', !!data.error);
-  renderSites(); renderServer(); renderUpdates();
+  const enabled = !!data.capabilities?.updates;
+  $('update-mode').textContent = enabled ? 'Updates enabled' : 'Read only'; $('version-mode').textContent = enabled ? 'VERSION 0.2 · UPDATES ON' : 'VERSION 0.2 · READ ONLY';
+  $('update-note').textContent = enabled ? 'Enabled for this dashboard. Open Updates to run one.' : 'Read only. Set "updates": true in the viewer config once site-update is installed on the server.';
+  renderSites(); renderServer(); renderUpdates(); renderHistory();
 }
 async function load(refresh = false) {
   $('refresh').disabled = true;

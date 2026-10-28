@@ -2,7 +2,7 @@
 
 A local dashboard for your WordPress sites and Linux server. A server collector writes a small JSON snapshot; the Windows/Linux viewer reads it over SSH. No remote-control plugin is installed on your sites.
 
-**v0.1 is the first read-only milestone.** It includes a working demo, collector, SSH transport and dashboard. Production deployment and automatic updates have not been performed. The updater, rollback engine and alerting watcher remain on the roadmap.
+**v0.2 adds controlled updates.** The read-only collector, SSH transport and dashboard from v0.1 now come with `site-update`: one plugin, theme, core or translation update at a time, with a backup first, an origin health check afterwards and automatic rollback when the check fails ([docs/UPDATER.md](docs/UPDATER.md)). Updates run only when you press Update, and only when the viewer config sets `"updates": true`. Nothing updates automatically.
 
 ## Try it
 
@@ -23,7 +23,7 @@ For an existing snapshot:
 python -m sitewatch --file status.local.json
 ```
 
-For SSH, copy `config/viewer.example.json` to `config.local.json`, set host/user/port, then run:
+For SSH, copy `config/viewer.example.json` to `config.local.json`, set host/user/port (and `"updates": true` once `site-update` and its sudoers rule are installed on the server), then run:
 
 ```powershell
 python -m sitewatch --config config.local.json
@@ -40,6 +40,7 @@ Use your existing OpenSSH agent and verified host key. On Windows the viewer use
 - Non-WordPress site health checks.
 - Stale/missing/failed snapshots, including retention of the last successful snapshot after a connection failure.
 - Per-site failure isolation, owner-only WP-CLI execution, atomic status replacement and collector locking.
+- Update buttons for reported plugin, theme and core updates, with confirmation, a recent-updates list from the server's log, and one update at a time (`site-update`, see [docs/UPDATER.md](docs/UPDATER.md)).
 - Manual GitHub Actions checks for Windows/Linux and Python 3.11/3.13.
 
 All demo readings are fictional and labelled. No demo number is evidence about the live server.
@@ -56,23 +57,23 @@ python -m compileall -q sitewatch
 node --check sitewatch/web/app.js
 ```
 
-Tests cover the data contract, stale clocks, SSH argument rejection, fixed remote command, owner-switch command construction, secret-field exclusion, broken-site isolation, GitHub failures, origin failures, local HTTP assets, host/origin/token checks and snapshot retention. Unix ownership tests execute on Linux and skip on Windows. These are unit and local HTTP integration tests, not live server acceptance tests.
+Tests cover the data contract, stale clocks, SSH argument rejection, fixed remote command, owner-switch command construction, secret-field exclusion, broken-site isolation, GitHub failures, origin failures, local HTTP assets, host/origin/token checks and snapshot retention. Unix ownership tests execute on Linux and skip on Windows. These are unit and local HTTP integration tests, not live server acceptance tests. `site-update` also has an acceptance suite for a disposable WordPress in Docker: [tests/disposable/README.md](tests/disposable/README.md).
 
 ## Update roadmap
 
 1. Validate this collector against every production site's manual inventory, without deploying changes to WordPress.
 2. Add timestamp-filtered PHP/5xx/FPM statistics, certificates, mail, fail2ban, firewall, Drive backups and watcher findings.
-3. Build the validated `site-update` wrapper: lock → backup → update → origin checks → rollback → audit log. Prove success, failure rollback and argument refusal on a disposable Linux WordPress first.
-4. Add update controls after that acceptance gate. Only then consider `DISALLOW_FILE_MODS` changes or nightly policies.
+3. ~~Build the validated `site-update` wrapper and update controls~~ (v0.2; proven on a disposable WordPress, not yet installed on production).
+4. Install `site-update` on the server, then consider `DISALLOW_FILE_MODS` changes and nightly policies.
 
-No sudoers rule, mutation endpoint, automatic update timer or production security-flag change is included in v0.1.
+No automatic update timer or production security-flag change is included. The only privilege `site-update` needs is one sudoers line for its wrapper.
 
 ## Limitations and security
 
 WP-CLI runs as each site owner with regular plugins, themes and packages skipped. Must-use plugins and drop-ins may still load. A compromised owner can falsify its own inventory; this collector is not a forensic integrity guarantee. Root never invokes PHP from a site root directly. Config gets are restricted to three named boolean constants.
 
-WP-CLI checks can refresh database update transients. “Read only” means no installs, updates or content/settings edits, not zero database writes. An empty update field means **none reported**, not a verified security status. Vendor updaters are skipped; configure GitHub mappings where applicable and review remaining commercial plugins separately. A GitHub comparison is version visibility only, not ZIP authenticity verification.
+WP-CLI checks can refresh database update transients. “Read only” means no installs, updates or content/settings edits, not zero database writes. An empty update field means **none reported**, not a verified security status. Vendor updaters are skipped; configure GitHub mappings where applicable and review remaining commercial plugins separately. The collector's GitHub comparison is version visibility only; `site-update` additionally checks the release ZIP against GitHub's SHA-256 digest, its folder name and its version header before installing it.
 
-Status output explicitly projects permitted fields and excludes raw command output, package URLs, config contents, option values and credentials. Local HTTP endpoints require an exact loopback Host; refresh also requires matching Origin and a random session token. There is no CORS access. Other processes running as your desktop user can still read localhost, so this is not a multi-user security boundary.
+Status output explicitly projects permitted fields and excludes raw command output, package URLs, config contents, option values and credentials. Local HTTP endpoints require an exact loopback Host; refresh and update also require matching Origin and a random session token. An update request must name an update the current snapshot reports, and the server checks it again. There is no CORS access. Other processes running as your desktop user can still read localhost, so this is not a multi-user security boundary.
 
 See [architecture and status contract](docs/ARCHITECTURE.md).

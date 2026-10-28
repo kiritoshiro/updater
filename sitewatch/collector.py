@@ -27,11 +27,14 @@ class CheckFailed(Exception):
     """Public, fixed text only. Never include command output or configuration."""
 
 
+ENV = {"PATH": "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin", "LANG": "C.UTF-8", "HOME": "/root"}
+
+
 def run(argv, timeout=65):
     try:
         proc = subprocess.run(argv, stdin=subprocess.DEVNULL, capture_output=True,
                               text=True, encoding="utf-8", errors="replace", timeout=timeout,
-                              check=False, env={"PATH": "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin", "LANG": "C.UTF-8", "HOME": "/root"}, cwd="/")
+                              check=False, env=ENV, cwd="/")
     except (OSError, subprocess.TimeoutExpired) as exc:
         raise CheckFailed("Command unavailable or timed out") from exc
     if proc.returncode or len(proc.stdout) > 4 * 1024 * 1024:
@@ -123,13 +126,20 @@ def validate_owner(site):
         raise CheckFailed("Site path must belong to its configured non-root owner")
 
 
+def as_owner(site, *argv, limit=60):
+    return ["/usr/bin/sudo", "-n", "-H", "-u", site["owner"], "--",
+            "/usr/bin/timeout", "--kill-after=5", str(limit), *argv]
+
+
+def wp_argv(site, *args, limit=60):
+    return as_owner(site, "/usr/bin/env", "WP_CLI_CONFIG_PATH=/dev/null", "WP_CLI_PACKAGES_DIR=/nonexistent",
+                    "/usr/local/bin/wp", f"--path={site['path']}", "--skip-plugins",
+                    "--skip-themes", "--skip-packages", "--no-color", *args, limit=limit)
+
+
 def wp(site, *args):
     validate_owner(site)
-    return run(["/usr/bin/sudo", "-n", "-H", "-u", site["owner"], "--",
-                "/usr/bin/timeout", "--kill-after=5", "60", "/usr/bin/env",
-                "WP_CLI_CONFIG_PATH=/dev/null", "WP_CLI_PACKAGES_DIR=/nonexistent",
-                "/usr/local/bin/wp", f"--path={site['path']}", "--skip-plugins",
-                "--skip-themes", "--skip-packages", "--no-color", *args])
+    return run(wp_argv(site, *args))
 
 
 class NoRedirect(HTTPRedirectHandler):

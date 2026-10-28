@@ -1,11 +1,16 @@
-"""Only fetch a fixed status file. Never accept a remote command from the UI."""
+"""Fixed remote commands only: read the status file and update log, or run site-update with
+arguments that match strict patterns. Nothing typed in the UI reaches the remote shell as text."""
 
+import json
 import os
 import re
 import subprocess
 from pathlib import Path
 
-from .model import decode_status
+from .model import DOMAIN, SLUG, decode_status
+
+UPDATE_KINDS = ("plugin", "theme", "core", "translations")
+RESULTS = ("updated", "unchanged", "refused", "rolled_back", "rollback_failed")
 
 
 def ssh_executable():
@@ -18,7 +23,7 @@ def ssh_executable():
     return "ssh"
 
 
-def ssh_command(config):
+def ssh_command(config, remote="cat /var/lib/site-watch/status.json"):
     host = config.get("host", "")
     user = config.get("user", "")
     port = config.get("port", 22)
@@ -30,8 +35,7 @@ def ssh_command(config):
         raise ValueError("Invalid SSH port")
     return [ssh_executable(), "-T", "-o", "BatchMode=yes", "-o", "ConnectTimeout=10",
             "-o", "StrictHostKeyChecking=yes", "-o", "ClearAllForwardings=yes",
-            "-p", str(port), "--", f"{user}@{host}",
-            "cat /var/lib/site-watch/status.json"]
+            "-p", str(port), "--", f"{user}@{host}", remote]
 
 
 def fetch_ssh(config):
@@ -49,3 +53,55 @@ def fetch_file(path):
     with Path(path).open("rb") as stream:
         from .model import MAX_STATUS_BYTES
         return decode_status(stream.read(MAX_STATUS_BYTES + 1))
+
+
+def update_command(config, site, kind, slug=None):
+    if not isinstance(site, str) or not DOMAIN.fullmatch(site) or kind not in UPDATE_KINDS:
+        raise ValueError("Invalid site or update kind")
+    if (kind in ("plugin", "theme")) != (slug is not None) or (slug is not None and not (isinstance(slug, str) and SLUG.fullmatch(slug))):
+        raise ValueError("Invalid component")
+    return ssh_command(config, " ".join(["sudo", "-n", "/usr/local/sbin/site-update", "--json", site, kind] + ([slug] if slug else [])))
+
+
+def clean_result(item):
+    """Keep only the log fields the dashboard shows, as short strings."""
+    if not isinstance(item, dict) or item.get("result") not in RESULTS:
+        raise ValueError("Invalid update result")
+    text = lambda value, limit=300: value[:limit] if isinstance(value, str) else None
+    return {key: text(item.get(key)) for key in ("time", "user", "site", "kind", "slug", "source", "from", "to", "result", "message")}
+
+
+def run_update(config, site, kind, slug=None):
+    """Run one validated update over SSH; returns cleaned results or raises ValueError."""
+    try:
+        result = subprocess.run(update_command(config, site, kind, slug), capture_output=True, timeout=45 * 60, check=False)
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        raise ValueError("The update did not report back. Check the update log before trying again.") from exc
+    try:
+        lines = result.stdout.decode("utf-8", errors="replace").strip().splitlines()
+        reply = json.loads(lines[-1])
+    except (IndexError, ValueError) as exc:
+        # Includes sudo refusing to run: no sudoers rule, or a password is required.
+        raise ValueError("The server did not run site-update. Check the sudoers rule and the SSH connection.") from exc
+    if isinstance(reply, dict) and isinstance(reply.get("error"), str):
+        raise ValueError(reply["error"][:300])
+    if not isinstance(reply, dict) or not isinstance(reply.get("results"), list):
+        raise ValueError("Unexpected reply from site-update")
+    return [clean_result(item) for item in reply["results"]]
+
+
+def fetch_update_log(config, limit=50):
+    try:
+        result = subprocess.run(ssh_command(config, f"tail -n {int(limit)} /var/lib/site-watch/update-log.jsonl 2>/dev/null || true"),
+                                capture_output=True, timeout=25, check=False)
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        raise ValueError("SSH unavailable or timed out") from exc
+    if result.returncode:
+        raise ValueError("Update log read failed")
+    items = []
+    for line in result.stdout.decode("utf-8", errors="replace").splitlines():
+        try:
+            items.append(clean_result(json.loads(line)))
+        except ValueError:
+            continue
+    return items[::-1]
