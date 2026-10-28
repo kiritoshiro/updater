@@ -1,7 +1,9 @@
 [Unit]
 Description=WP Site Watch nightly updates for sites whose nightly switch is on
 Wants=network-online.target
-After=network-online.target
+# Ordering only: on shutdown systemd stops this unit first, so a rollback still has the database,
+# PHP-FPM and nginx for its import and health check. Units that do not exist are ignored.
+After=network-online.target mariadb.service mysql.service nginx.service php8.4-fpm.service
 
 [Service]
 Type=oneshot

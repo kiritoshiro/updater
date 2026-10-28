@@ -81,7 +81,9 @@ function renderServer() {
 const RESULT_BADGES = {updated: ['Updated', 'good'], unchanged: ['No change', 'neutral'], refused: ['Refused', 'neutral'], rolled_back: ['Rolled back', 'warn'], rollback_failed: ['Rollback failed', 'bad']};
 function canUpdate(item) { return !!payload?.capabilities?.updates && ['plugin', 'theme', 'core'].includes(item.type); }
 function itemLabel(r) { return r.kind === 'core' ? 'WordPress core' : r.kind === 'translations' ? 'Translations' : r.slug; }
-function showBanner(text, error) { $('banner').textContent = text; $('banner').hidden = false; $('banner').classList.toggle('error', error); $('banner').scrollIntoView({block: 'nearest', behavior: 'smooth'}); }
+// The last action's result stays visible across re-renders (auto-load every minute) until the next action.
+let notice = null;
+function showBanner(text, error) { notice = {text, error}; $('banner').textContent = text; $('banner').hidden = false; $('banner').classList.toggle('error', error); $('banner').scrollIntoView({block: 'nearest', behavior: 'smooth'}); }
 const selected = new Set();
 const key = (site, item) => `${site.id}|${item.type}|${item.name}`;
 const label = item => item.type === 'core' ? 'WordPress core' : item.name;
@@ -118,11 +120,13 @@ async function runSelected() {
   const chosen = selectedItems();
   if (!chosen.length) return;
   const sites = new Set(chosen.map(({site}) => site.id));
+  const major = item => item.type === 'core' && String(item.version).split('.').slice(0, 2).join('.') !== String(item.update_version).split('.').slice(0, 2).join('.');
   const answer = await ask({title: `Update ${chosen.length} item${chosen.length > 1 ? 's' : ''} on ${sites.size} site${sites.size > 1 ? 's' : ''}?`, ok: 'Update all',
     option: chosen.some(({item}) => item.type !== 'core'),
+    items: chosen.map(({site, item}) => [`${label(item)} ${item.version || '?'} → ${item.update_version} · ${site.id}${major(item) ? ' · NEW MAJOR VERSION' : ''}`, major(item)]),
     text: 'They run one after another, each with its own backup, health check and automatic rollback. If one fails on a site, the rest of that site’s selection is skipped; other sites continue. Keep this page open.'});
   if (!answer) return;
-  updating = true; renderUpdates();
+  notice = null; updating = true; renderUpdates();
   const done = [], failed = new Set();
   for (const [index, {site, item}] of chosen.entries()) {
     if (failed.has(site.id)) { done.push({site, item, r: {result: 'skipped'}}); continue; }
@@ -141,11 +145,12 @@ async function runSelected() {
   showBanner(`${summary}.${problems.length ? ' ' + problems.join(' · ') + '.' : ''} The inventory refreshes within a minute.`, !!problems.length);
   setTimeout(() => load(true), 60000);
 }
-function ask({title, text, ok, option = false}) {
+function ask({title, text, ok, option = false, items = []}) {
   // One dialog for confirmations; resolves to null (cancel) or {restoreDatabase}.
   return new Promise(resolve => {
-    const dialog = $('confirm'), box = $('confirm-restore-db');
+    const dialog = $('confirm'), box = $('confirm-restore-db'), list = $('confirm-list');
     $('confirm-title').textContent = title; $('confirm-text').textContent = text; $('confirm-ok').textContent = ok;
+    list.replaceChildren(...items.map(([line, warn]) => node('li', line, warn ? 'warn-line' : undefined))); list.hidden = !items.length;
     $('confirm-option').hidden = !option; box.checked = true;
     const finish = value => { dialog.close(); $('confirm-ok').onclick = $('confirm-cancel').onclick = dialog.oncancel = null; resolve(value); };
     $('confirm-ok').onclick = () => finish({restoreDatabase: box.checked});
@@ -287,7 +292,8 @@ function render(data) {
   if (snapshot?.demo) messages.push('DEMO WORKSPACE · All versions, checks and metrics shown here are sample data.');
   if (data.error) messages.push(`${data.error}${snapshot ? ' Showing the last successful snapshot.' : ''}`);
   if (data.freshness?.stale) messages.push(data.freshness.clock_skew ? 'Snapshot time is in the future. Check the server clock.' : `Snapshot is stale since ${date(snapshot.collected_at)}. Refresh reads the latest file; it does not trigger the server collector.`);
-  $('banner').textContent = messages.join(' '); $('banner').hidden = !messages.length; $('banner').classList.toggle('error', !!data.error);
+  if (notice) messages.unshift(notice.text);
+  $('banner').textContent = messages.join(' '); $('banner').hidden = !messages.length; $('banner').classList.toggle('error', !!data.error || !!notice?.error);
   const enabled = !!data.capabilities?.updates;
   $('update-mode').textContent = enabled ? 'Updates enabled' : 'Read only'; $('version-mode').textContent = enabled ? 'VERSION 0.2 · UPDATES ON' : 'VERSION 0.2 · READ ONLY';
   $('update-note').textContent = enabled ? 'Enabled for this dashboard. Open Updates to run one.' : 'Read only. Set "updates": true in the viewer config once site-update is installed on the server.';

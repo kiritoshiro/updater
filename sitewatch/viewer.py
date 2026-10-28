@@ -89,7 +89,13 @@ class State:
         if not any(s["id"] == request["site"] and s["kind"] == "wordpress" for s in self.data["sites"]):
             raise ValueError("Unknown WordPress site")
         setting = self.updates.set_nightly(request["site"], request["enabled"])
-        self.nightly = {**(self.nightly or {}), request["site"]: setting}
+        if self.nightly is None:
+            try:
+                self.history, self.nightly = self.updates.server_state()
+            except ValueError:
+                pass
+        if self.nightly is not None:
+            self.nightly = {**self.nightly, request["site"]: setting}
         return setting
 
 
