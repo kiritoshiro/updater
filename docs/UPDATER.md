@@ -1,7 +1,8 @@
 # site-update: validated updates with backup and rollback
 
-`site-update` is Phase 4 of the dashboard plan. It updates one WordPress component on one site,
-and puts everything back if the site breaks. The dashboard runs it over SSH through a single
+`site-update` is Phase 4 of the dashboard plan. It updates one WordPress component on one site, or
+one of our own web apps to the newest commit of its branch ("Web apps" below), and puts everything
+back if the site breaks. The dashboard runs it over SSH through a single
 sudoers rule; it can also be run by hand on the server.
 
 ```sh
@@ -10,6 +11,7 @@ sudo site-update <site> theme <slug>
 sudo site-update <site> core
 sudo site-update <site> translations
 sudo site-update <site> all            # every plugin and theme update in the inventory, one by one
+sudo site-update <site> app <commit>   # a web app: the newest commit of its branch, full 40-character SHA
 sudo site-update --files-only-rollback <site> plugin <slug>   # on failure, restore files but not the database
 sudo site-update <site> nightly on|off # the site's nightly switch
 sudo site-update --json <site> ...     # one JSON line for the dashboard
@@ -44,6 +46,71 @@ own automatic background updates are off, so the switch is how a locked site sta
 
 Exit codes: 0 updated or nothing to change, 1 setup problem, 2 refused (nothing changed),
 3 rolled back (site healthy again), 4 rollback failed (check the site now).
+
+## Web apps
+
+Our own apps that are deployed from GitHub (not WordPress) are web sites with an `app` block in
+`collector.json`. Only the newest commit of the configured branch is offered, and only when the
+repository's security gate passed on **that exact commit**. Updates are manual only; there is no
+nightly switch for apps.
+
+```json
+{"id": "app.example.org", "kind": "web", "owner": "appuser", "path": "/home/appuser/app", "health_paths": ["/", "/login"],
+ "app": {"type": "laravel", "repository": "owner/repo", "branch": "main",
+         "database": {"format": "env", "file": ".env", "name": "appdb"}}}
+```
+
+- `type` is how the app is deployed:
+  - `laravel`: a Git checkout. Maintenance mode on, `git checkout -B <branch> <commit>`,
+    `composer install --no-dev`, `artisan migrate --force`, the caches rebuilt, maintenance mode off.
+  - `git`: a Git checkout and nothing else (an app that migrates itself on the next request).
+  - `copy`: the commit's GitHub archive; the folder `source` (default `server`) is copied over the
+    web root as the owner. Top-level names in `keep` (uploads, storage) are never touched, folders in
+    `clear` (old build assets) are emptied first, nothing else is deleted, and the commit is recorded
+    in `storage/last-update.json`, as the app's own updater does. Public repositories only.
+- `database` says where the app keeps its own database login: `format` `env` (Laravel's
+  `DB_HOST`, `DB_PORT`, `DB_DATABASE`, `DB_USERNAME`, `DB_PASSWORD`) or `php` (a file that returns an
+  array; `keys` names its entries for `host`, `port`, `name`, `user`, `password`), `file` inside the app
+  and the expected database `name`. The dump and restore run as the owner with that login
+  (`sitewatch/appdb.php`), so root needs no database password; the password goes to the client in
+  `MYSQL_PWD`, never on a command line. If the file names another database, the backup is refused.
+- `php` (default `/usr/bin/php8.4`) and `composer` (default `/usr/local/bin/composer`) are optional.
+
+**The collector** reads the installed commit as the owner (`git rev-parse HEAD`, or the recorded
+commit for `copy`), asks GitHub for the branch head, compares the two and, when the branch is ahead,
+reads the gate: the job "All security checks passed" of `security-gate.yml`, on exactly that commit,
+in a `push`, `schedule` or `workflow_dispatch` run on the deployed branch itself. A pull request run
+scanned the merge preview, with fewer checks; `pull_request_target`, `workflow_run` and similar runs
+use the default branch's workflow and can report a commit they did not scan; a run on another branch
+may have behaved differently. None of them count.
+The result is `passed`, `failed`, `pending` or `missing`. The dashboard lists the commit under "Web
+apps" with its message and gate; Update is offered only when it passed.
+
+**One app update**, besides the steps under "What one update does":
+
+1. The commit must be the one the inventory offers, still the branch head on GitHub, and the gate must
+   have passed on it, checked again at that moment.
+2. Git apps: the checkout must have no tracked local changes. The branch is fetched with the owner's
+   deploy key, and the fetched head must be the commit GitHub reported and must build on the installed
+   commit (no downgrades or side branches). A checkout that was left detached (for example by the
+   app's own updater) is put on the branch.
+   Copy apps: GitHub must report the commit as ahead of the recorded one, the archive is checked
+   (one top folder, no absolute paths, `..` or links, at most 128 MB, 512 MB unpacked), and the branch
+   head is checked once more after the download, before anything changes.
+3. Backup: the database, plus `vendor` (Laravel) or the web root without `keep` (copy). Git keeps the
+   old commit itself. The dump must be complete (mariadb-dump's first and last lines), and a config
+   file that prints anything or ends the helper early (an `exit` guard) fails the backup instead of
+   leaving an empty one. A restore checks the dump is complete before it drops anything.
+4. Rollback: the previous commit (and branch, or detached state) is checked out again, the backed-up
+   files are put back (for copy, also every top-level name the new commit wrote), Laravel's generated
+   `bootstrap/cache` files are deleted (they may list a package the failed commit added), the local branch
+   is put back where it was if the checkout was detached, and the database is restored: every table,
+   view and stored routine is dropped first, so none that a failed migration created survives.
+   A rollback always restores the database (`--files-only-rollback` is refused for apps).
+
+Deploy keys stay where they are (in the owners' `~/.ssh`); site-update never reads them. GitHub
+API calls use the read-only token from `github_token_file` (see "Updater deployment" in
+`docs/DEPLOYMENT.md`), sent to `api.github.com` only, never to the archive host or anywhere else.
 
 ## What one update does
 
@@ -119,6 +186,12 @@ Exit codes: 0 updated or nothing to change, 1 setup problem, 2 refused (nothing 
   site's `health_paths`, for example `/category/<slug>/`. Paths cannot contain `?`.
 - There is no undo after a successful update other than restoring the backup by hand:
   `tar -xf files.tar` and `wp db import database.sql`, both as the site owner.
+- Apps: a commit that only a pull request run checked has no gate result, so the repository's gate
+  must also run on pushes to the deployed branch. The gate is the workflow in the commit itself, so
+  protect the deployed branch (required reviews or checks) so that nobody can push a commit whose own
+  workflow simply passes. Only the branch head can be installed; to go back
+  to an older commit, revert it on the branch. Cron jobs or workers that write to the database during
+  the update are not paused, and their writes are lost if it is rolled back.
 
 ## Install on the server
 
@@ -126,7 +199,9 @@ See "Updater deployment" in `docs/DEPLOYMENT.md`.
 
 ## Tests
 
-- Unit tests: `python -m unittest discover -s tests` (`tests/test_updater.py`).
+- Unit tests: `python -m unittest discover -s tests` (`tests/test_updater.py`, `tests/test_apps.py`).
+- App updates on a disposable server with real copies of the three apps and a fake GitHub API:
+  `tests/disposable/apps/README.md`.
 - Acceptance on a disposable WordPress in Docker: `tests/disposable/README.md`. It covers
   refusals with their exit codes, serialisation, wordpress.org and GitHub updates, plugin and core
   forced-failure rollback, SIGTERM (rolls back) and SIGHUP (ignored) during an update,

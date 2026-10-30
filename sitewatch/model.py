@@ -7,6 +7,7 @@ import re
 MAX_STATUS_BYTES = 8 * 1024 * 1024
 DOMAIN = re.compile(r"(?=.{1,253}$)[a-z0-9](?:[a-z0-9.-]*[a-z0-9])?\Z", re.ASCII)
 SLUG = re.compile(r"[a-zA-Z0-9][a-zA-Z0-9_.-]{0,199}\Z", re.ASCII)
+COMMIT = re.compile(r"[0-9a-f]{40}\Z", re.ASCII)
 
 
 def utcnow():
@@ -63,7 +64,29 @@ def validate_status(data):
         for check in site.get("health", []):
             if not isinstance(check, dict) or type(check.get("ok")) is not bool or not isinstance(check.get("path"), str):
                 raise ValueError("Invalid health check")
+        validate_app(site.get("app"))
     return data
+
+
+def validate_app(app):
+    """A web app's installed commit and the newest commit on its branch (apps.app_inventory)."""
+    if app is None:
+        return
+    if not isinstance(app, dict) or app.get("type") not in ("laravel", "git", "copy"):
+        raise ValueError("Invalid app inventory")
+    for field in ("repository", "branch", "relation", "check_state"):
+        if app.get(field) is not None and not isinstance(app[field], str):
+            raise ValueError("Invalid app field")
+    if app.get("commit") is not None and not COMMIT.fullmatch(str(app["commit"])):
+        raise ValueError("Invalid installed commit")
+    update = app.get("update")
+    if update is not None:
+        if (not isinstance(update, dict) or not COMMIT.fullmatch(str(update.get("sha", "")))
+                or update.get("gate") not in ("passed", "failed", "pending", "missing")):
+            raise ValueError("Invalid app update")
+        for field in ("date", "message"):
+            if update.get(field) is not None and not isinstance(update[field], str):
+                raise ValueError("Invalid app update field")
 
 
 def decode_status(raw):

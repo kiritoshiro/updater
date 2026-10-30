@@ -3,6 +3,7 @@
   "origin_ip": "203.0.113.10",
   "ca_file": "/etc/site-watch/cloudflare-origin-ca.pem",
   "ignore_failed_units": ["user@*.service"],
+  "github_token_file": "/etc/site-watch/github-token",
   "github": {
     "theme:example-theme": "your-account/your-theme"
   },
@@ -23,6 +24,19 @@
       "kind": "web",
       "ca_file": null,
       "health_paths": ["/"]
+    },
+    {
+      "id": "laravel.example.org",
+      "kind": "web",
+      "owner": "laravelapp",
+      "path": "/home/laravelapp/app",
+      "health_paths": ["/", "/login"],
+      "app": {
+        "type": "laravel",
+        "repository": "your-account/your-app",
+        "branch": "main",
+        "database": {"format": "env", "file": ".env", "name": "laravelapp"}
+      }
     }
   ]
 }

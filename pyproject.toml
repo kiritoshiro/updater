@@ -14,7 +14,7 @@ site-watch = "sitewatch.__main__:main"
 site-collect = "sitewatch.collector:main"
 
 [tool.setuptools.package-data]
-sitewatch = ["web/*"]
+sitewatch = ["web/*", "appdb.php"]
 
 [tool.setuptools.packages.find]
 include = ["sitewatch*"]

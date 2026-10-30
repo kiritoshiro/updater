@@ -84,4 +84,25 @@ sudo -n /usr/bin/id                                                   # must fai
 
 5. Run a first real update by hand on one site, on a plugin you can live without for a minute, and read the result and `/var/lib/site-watch/update-log.jsonl`. Then set `"updates": true` in the viewer's `config.local.json`.
 
+### Web app updates
+
+1. The repository's security gate must run on pushes to the deployed branch (see "Web apps" in
+   `docs/UPDATER.md`), or no new commit will ever have a gate result.
+2. For private repositories, create a fine-grained GitHub token limited to those repositories with
+   **Contents: read** and **Actions: read** (Metadata is added automatically), and store it root-only:
+
+```sh
+sudo install -o root -g root -m 0600 /dev/null /etc/site-watch/github-token
+sudo nano /etc/site-watch/github-token        # paste the token, one line
+```
+
+   and add `"github_token_file": "/etc/site-watch/github-token"` to `collector.json`. Public
+   repositories work without it (at a lower GitHub rate limit). The token is never written to
+   `status.json`, the log or a command line.
+3. Add the `app` block to each app's site in `collector.json` (owner, path, health paths, type,
+   repository, branch, database), run the collector and check the app's inventory in `status.json`.
+4. Check that each owner can fetch with its deploy key (`sudo -u <owner> git -C <path> ls-remote origin`)
+   and that its checkout is clean, then run one update by hand when the dashboard shows a commit with a
+   passed gate.
+
 To remove it: `sudo systemctl disable --now site-update-nightly.timer`, then `sudo rm /etc/sudoers.d/site-update /usr/local/sbin/site-update /etc/systemd/system/site-update-nightly.*`. The update log and backups stay until deleted; backups are pruned only by `site-update` itself.
