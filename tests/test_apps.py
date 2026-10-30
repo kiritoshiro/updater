@@ -229,8 +229,7 @@ class FakeApp:
         if args == ["db", "import"]:
             self.imported = stdin.read()
         if args[:2] == ["git", "for-each-ref"]:
-            return f"refs/heads/main/x {OTHER}
-refs/heads/main {OLD}"
+            return f"refs/heads/main/x {OTHER}\nrefs/heads/main {OLD}"
         if args[:2] == ["git", "rev-parse"]:
             return self.head if args[-1] == "HEAD" else NEW
         if args[:2] == ["git", "status"]:
