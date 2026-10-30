@@ -67,27 +67,25 @@ def branch_head(repository, branch, api):
 
 
 def gate_state(repository, sha, branch, api):
-    """passed, failed, pending or missing: the security gate job on exactly this commit, on branch."""
+    """passed, failed, pending or missing: the security gate job on exactly this commit, on branch.
+    The newest run decides: a scheduled run that fails on a new advisory outweighs an older pass,
+    and a run still going means pending."""
     runs = api(f"/repos/{repository}/actions/runs?head_sha={sha}&per_page=50").get("workflow_runs", [])
-    seen = set()
-    for run in runs if isinstance(runs, list) else []:
-        if (not isinstance(run, dict) or run.get("head_sha") != sha or run.get("path") not in GATE_WORKFLOWS
-                or run.get("event") not in GATE_EVENTS or run.get("head_branch") != branch or type(run.get("id")) is not int):
-            continue
+    matching = [run for run in (runs if isinstance(runs, list) else [])
+                if isinstance(run, dict) and run.get("head_sha") == sha and run.get("path") in GATE_WORKFLOWS
+                and run.get("event") in GATE_EVENTS and run.get("head_branch") == branch and type(run.get("id")) is int]
+    newest_first = sorted(matching, key=lambda run: (run.get("run_number") if type(run.get("run_number")) is int else 0, run["id"]),
+                          reverse=True)
+    for run in newest_first:
         jobs = api(f"/repos/{repository}/actions/runs/{run['id']}/jobs?per_page=100").get("jobs", [])
-        found = False
         for job in jobs if isinstance(jobs, list) else []:
             if isinstance(job, dict) and job.get("name") in GATE_JOBS and job.get("head_sha") == sha:
-                found = True
                 if job.get("status") != "completed":
-                    seen.add("pending")
-                elif job.get("conclusion") == "success":
-                    return "passed"
-                else:
-                    seen.add("failed")
-        if not found and run.get("status") != "completed":
-            seen.add("pending")  # the gate job starts after the scans
-    return "pending" if "pending" in seen else "failed" if "failed" in seen else "missing"
+                    return "pending"
+                return "passed" if job.get("conclusion") == "success" else "failed"
+        if run.get("status") != "completed":
+            return "pending"  # the gate job starts after the scans
+    return "missing"
 
 
 def relation(repository, base, head, api):
@@ -235,16 +233,15 @@ class AppUpdater(Updater):
                 branch = self.git("symbolic-ref", "--quiet", "--short", "HEAD")
             except CheckFailed:
                 branch = None  # detached, e.g. by the app's own updater
-            try:  # where the local branch pointed, so a rollback from a detached checkout can put it back
-                local = self.git("rev-parse", "--verify", "--quiet", f"refs/heads/{self.app['branch']}")
-            except CheckFailed:
-                local = None
+            # Where the local branch pointed (empty: no such branch), so a rollback from a detached
+            # checkout can put it back. A failed lookup refuses the update rather than guess.
+            local = self.git("for-each-ref", "--format=%(objectname)", f"refs/heads/{self.app['branch']}") or None
             self.before = {"sha": current, "branch": branch, "local": local}
             branch_ref = f"refs/remotes/origin/{self.app['branch']}"
             self.git("fetch", "--no-tags", "--quiet", "origin", f"+refs/heads/{self.app['branch']}:{branch_ref}", limit=300)
             fetched = self.git("rev-parse", "--verify", branch_ref)
         except CheckFailed as exc:
-            raise Refused("Fetching the branch with the app's deploy key failed") from exc
+            raise Refused("Reading the checkout or fetching the branch with the app's deploy key failed") from exc
         if fetched != slug:
             raise Refused("The fetched branch does not match the commit GitHub reports")
         try:

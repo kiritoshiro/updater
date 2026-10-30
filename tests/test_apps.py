@@ -16,8 +16,9 @@ OLD, NEW, OTHER = "a" * 40, "b" * 40, "c" * 40
 REPO = "kiritoshiro/app"
 
 
-def run(path, event="push", status="completed", run_id=1, sha=NEW, branch="main"):
-    return {"id": run_id, "head_sha": sha, "head_branch": branch, "path": path, "event": event, "status": status}
+def run(path, event="push", status="completed", run_id=1, sha=NEW, branch="main", number=None):
+    return {"id": run_id, "run_number": run_id if number is None else number, "head_sha": sha, "head_branch": branch,
+            "path": path, "event": event, "status": status}
 
 
 def job(conclusion="success", status="completed", name="All security checks passed", sha=NEW):
@@ -69,7 +70,9 @@ class GateTests(unittest.TestCase):
             ([run(".github/workflows/other.yml")], {1: [job()]}, "missing"),  # nor does another workflow
             ([run(gate, sha=OTHER)], {1: [job()]}, "missing"),
             ([run(gate)], {1: [job(sha=OTHER)]}, "missing"),
-            ([run(gate), run(gate, run_id=2)], {1: [job("failure")], 2: [job()]}, "passed"),  # a passing rerun
+            ([run(gate), run(gate, run_id=2)], {1: [job("failure")], 2: [job()]}, "passed"),  # a newer run passed
+            ([run(gate), run(gate, run_id=2, event="schedule")], {1: [job()], 2: [job("failure")]}, "failed"),  # a newer one failed
+            ([run(gate), run(gate, run_id=2, status="in_progress")], {1: [job()], 2: []}, "pending"),  # the newest is still going
             ([], {}, "missing"),
         ]
         for runs, jobs, expected in cases:
@@ -224,8 +227,10 @@ class FakeApp:
             stdout.write(self.dump)
         if args == ["db", "import"]:
             self.imported = stdin.read()
+        if args[:2] == ["git", "for-each-ref"]:
+            return OLD
         if args[:2] == ["git", "rev-parse"]:
-            return self.head if args[-1] == "HEAD" else OLD if args[-1] == "refs/heads/main" else NEW
+            return self.head if args[-1] == "HEAD" else NEW
         if args[:2] == ["git", "status"]:
             return self.dirty
         if args[:2] == ["git", "symbolic-ref"]:
@@ -299,8 +304,9 @@ class AppUpdateTests(unittest.TestCase):
         self.assertEqual(result["result"], "rolled_back")
         removal = next(i for i, c in enumerate(fake.calls) if c[:2] == ["/usr/bin/rm", "-f"])
         self.assertEqual(sorted(Path(p).name for p in fake.calls[removal][3:]), ["packages.php", "routes-v7.php", "services.php"])
-        first_artisan_after = next(i for i, c in enumerate(fake.calls) if i > removal and c[0] == "artisan")
-        self.assertGreater(first_artisan_after, removal)
+        restored_vendor = max(i for i, c in enumerate(fake.calls) if c[0] == "/usr/bin/tar" and "-xf" in c)
+        artisan_after_restore = [i for i, c in enumerate(fake.calls) if c[0] == "artisan" and i > restored_vendor]
+        self.assertTrue(restored_vendor < removal < min(artisan_after_restore))
         self.assertLess(removal, next(i for i, c in enumerate(fake.calls) if c == ["db", "import"]))
 
     def test_laravel_steps_and_failed_migration(self):
@@ -325,6 +331,7 @@ class AppUpdateTests(unittest.TestCase):
             ({"prepare": lambda fake: setattr(fake, "dirty", " M app.php")}, "local changes"),
             ({"fail_on": ["git", "fetch"]}, "deploy key"),
             ({"fail_on": ["git", "merge-base"]}, "does not build on"),
+            ({"fail_on": ["git", "for-each-ref"]}, "Reading the checkout"),
             ({"prepare": lambda fake: setattr(fake, "dump", b"-- MariaDB dump\nCREATE TABLE t (id int);\n")}, "backup failed"),
             ({"prepare": lambda fake: setattr(fake, "dump", b"")}, "backup failed"),
         ]
@@ -339,6 +346,29 @@ class AppUpdateTests(unittest.TestCase):
         self.inventory["app"]["update"]["sha"] = OTHER
         result, _ = self.update()
         self.assertIn("does not offer this commit", result["message"])
+
+
+    def test_copy_app_rechecks_the_branch_after_download(self):
+        github = FakeGitHub()
+        heads = iter([NEW, OTHER])  # the branch moves while the archive downloads
+        original = github.__call__
+
+        def moving(path):
+            data = original(path)
+            return {**data, "sha": next(heads)} if path.startswith(f"/repos/{REPO}/commits/") else data
+        github.__call__ = moving
+        site = git_site(self.root / "app", "copy")
+        fake = FakeApp(site)
+        fake_record = lambda argv, timeout=65, stdin=None, stdout=None: (
+            json.dumps({"sha": OLD}) if "/usr/bin/head" in argv else fake(argv, timeout, stdin, stdout))
+        updater = AppUpdater(site, self.inventory, run=fake_record, health=self.health, sleep=lambda _: None,
+                             fetch_json=lambda url, accept, limit, token: moving(url.removeprefix(apps.API)),
+                             backups=self.root / "backups", say=lambda *_: None)
+        with mock.patch.object(apps, "download", lambda url, limit: zipped(GOOD)):
+            result = updater.update("app", NEW)
+        self.assertEqual(result["result"], "refused")
+        self.assertIn("moved on", result["message"])
+        self.assertFalse(fake.ran("db", "dump"))
 
 
 class ConfigTests(unittest.TestCase):
