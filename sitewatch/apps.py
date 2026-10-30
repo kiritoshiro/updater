@@ -235,7 +235,9 @@ class AppUpdater(Updater):
                 branch = None  # detached, e.g. by the app's own updater
             # Where the local branch pointed (empty: no such branch), so a rollback from a detached
             # checkout can put it back. A failed lookup refuses the update rather than guess.
-            local = self.git("for-each-ref", "--format=%(objectname)", f"refs/heads/{self.app['branch']}") or None
+            ref = f"refs/heads/{self.app['branch']}"  # for-each-ref also lists refs below it: match exactly
+            listed = self.git("for-each-ref", "--format=%(refname) %(objectname)", ref).splitlines()
+            local = next((line.split(" ", 1)[1] for line in listed if line.split(" ", 1)[0] == ref), None)
             self.before = {"sha": current, "branch": branch, "local": local}
             branch_ref = f"refs/remotes/origin/{self.app['branch']}"
             self.git("fetch", "--no-tags", "--quiet", "origin", f"+refs/heads/{self.app['branch']}:{branch_ref}", limit=300)

@@ -73,6 +73,7 @@ class GateTests(unittest.TestCase):
             ([run(gate), run(gate, run_id=2)], {1: [job("failure")], 2: [job()]}, "passed"),  # a newer run passed
             ([run(gate), run(gate, run_id=2, event="schedule")], {1: [job()], 2: [job("failure")]}, "failed"),  # a newer one failed
             ([run(gate), run(gate, run_id=2, status="in_progress")], {1: [job()], 2: []}, "pending"),  # the newest is still going
+            ([run(gate, run_id=9, number=1), run(gate, run_id=2, number=5)], {9: [job()], 2: [job("failure")]}, "failed"),  # by run number, not id
             ([], {}, "missing"),
         ]
         for runs, jobs, expected in cases:
@@ -228,7 +229,8 @@ class FakeApp:
         if args == ["db", "import"]:
             self.imported = stdin.read()
         if args[:2] == ["git", "for-each-ref"]:
-            return OLD
+            return f"refs/heads/main/x {OTHER}
+refs/heads/main {OLD}"
         if args[:2] == ["git", "rev-parse"]:
             return self.head if args[-1] == "HEAD" else NEW
         if args[:2] == ["git", "status"]:
@@ -356,7 +358,6 @@ class AppUpdateTests(unittest.TestCase):
         def moving(path):
             data = original(path)
             return {**data, "sha": next(heads)} if path.startswith(f"/repos/{REPO}/commits/") else data
-        github.__call__ = moving
         site = git_site(self.root / "app", "copy")
         fake = FakeApp(site)
         fake_record = lambda argv, timeout=65, stdin=None, stdout=None: (
