@@ -78,9 +78,11 @@ nightly switch for apps.
 
 **The collector** reads the installed commit as the owner (`git rev-parse HEAD`, or the recorded
 commit for `copy`), asks GitHub for the branch head, compares the two and, when the branch is ahead,
-reads the gate: the job "All security checks passed" (or "security-gate / All security checks
-passed" from a release run) of `security-gate.yml` or `release.yml`, on exactly that commit, from
-any event except `pull_request` (a pull request run scanned the merge preview, with fewer checks).
+reads the gate: the job "All security checks passed" of `security-gate.yml`, on exactly that commit,
+in a `push`, `schedule` or `workflow_dispatch` run on the deployed branch itself. A pull request run
+scanned the merge preview, with fewer checks; `pull_request_target`, `workflow_run` and similar runs
+use the default branch's workflow and can report a commit they did not scan; a run on another branch
+may have behaved differently. None of them count.
 The result is `passed`, `failed`, `pending` or `missing`. The dashboard lists the commit under "Web
 apps" with its message and gate; Update is offered only when it passed.
 
@@ -92,13 +94,18 @@ apps" with its message and gate; Update is offered only when it passed.
    deploy key, and the fetched head must be the commit GitHub reported and must build on the installed
    commit (no downgrades or side branches). A checkout that was left detached (for example by the
    app's own updater) is put on the branch.
-   Copy apps: GitHub must report the commit as ahead of the recorded one, and the archive is checked
-   (one top folder, no absolute paths, `..` or links, at most 128 MB, 512 MB unpacked) before anything changes.
+   Copy apps: GitHub must report the commit as ahead of the recorded one, the archive is checked
+   (one top folder, no absolute paths, `..` or links, at most 128 MB, 512 MB unpacked), and the branch
+   head is checked once more after the download, before anything changes.
 3. Backup: the database, plus `vendor` (Laravel) or the web root without `keep` (copy). Git keeps the
-   old commit itself.
+   old commit itself. The dump must be complete (mariadb-dump's first and last lines), and a config
+   file that prints anything or ends the helper early (an `exit` guard) fails the backup instead of
+   leaving an empty one. A restore checks the dump is complete before it drops anything.
 4. Rollback: the previous commit (and branch, or detached state) is checked out again, the backed-up
-   files are put back (for copy, also every top-level name the new commit wrote), and the database is
-   restored: every table is dropped first, so tables a failed migration created do not survive.
+   files are put back (for copy, also every top-level name the new commit wrote), Laravel's generated
+   `bootstrap/cache` files are deleted (they may list a package the failed commit added), the local branch
+   is put back where it was if the checkout was detached, and the database is restored: every table,
+   view and stored routine is dropped first, so none that a failed migration created survives.
    A rollback always restores the database (`--files-only-rollback` is refused for apps).
 
 Deploy keys stay where they are (in the owners' `~/.ssh`); site-update never reads them. GitHub
@@ -180,7 +187,9 @@ API calls use the read-only token from `github_token_file` (see "Updater deploym
 - There is no undo after a successful update other than restoring the backup by hand:
   `tar -xf files.tar` and `wp db import database.sql`, both as the site owner.
 - Apps: a commit that only a pull request run checked has no gate result, so the repository's gate
-  must also run on pushes to the deployed branch. Only the branch head can be installed; to go back
+  must also run on pushes to the deployed branch. The gate is the workflow in the commit itself, so
+  protect the deployed branch (required reviews or checks) so that nobody can push a commit whose own
+  workflow simply passes. Only the branch head can be installed; to go back
   to an older commit, revert it on the branch. Cron jobs or workers that write to the database during
   the update are not paused, and their writes are lost if it is rolled back.
 

@@ -87,8 +87,9 @@ check "files-only rollback: classic-widgets back at 0.2, site 200" test "$(wpv p
 echo "== our GitHub plugin from its verified release"
 update $SITE plugin adventistai-cookie-consent; code=$?
 check "result updated (exit $code), source github" test $code -eq 0 -a "$(last source)" = github
-check "cookie consent at 1.0.17 ($(wpv plugin get adventistai-cookie-consent --field=version))" \
-  test "$(wpv plugin get adventistai-cookie-consent --field=version)" = "1.0.17"
+latest=$(curl -fsS https://api.github.com/repos/kiritoshiro/wp-cookie-consent/releases/latest | python3 -c 'import json, sys; print(json.load(sys.stdin)["tag_name"].lstrip("v"))')
+check "cookie consent at the latest release $latest ($(wpv plugin get adventistai-cookie-consent --field=version))" \
+  test "$(wpv plugin get adventistai-cookie-consent --field=version)" = "$latest"
 check "cookie consent still active" test "$(wpv plugin get adventistai-cookie-consent --field=status)" = active
 collect
 update $SITE plugin adventistai-cookie-consent >/dev/null 2>&1; code=$?

@@ -82,6 +82,14 @@ check "previous commit and branch are back" '[ "$(head_of adventos $A)" = "$A1" 
 check "database restored: the new table is gone, the old one kept" '[ "$(table adventos site_update_probe2)" = 0 ] && [ "$(table adventos site_update_probe)" = 1 ]'
 check "healthy and out of maintenance mode after the rollback" '[ ! -e $A/storage/framework/down ] && [ "$(status adventos.test /login)" = 200 ]'
 
+# A failed commit that adds an auto-discovered package: its name lands in bootstrap/cache/packages.php,
+# which must not stop artisan from starting the restored code.
+A2b=$(testcommit AdventOS 6.0 "Test: add a package (still broken)" "COMPOSER_ALLOW_SUPERUSER=1 composer require spatie/laravel-honeypot --no-install --no-scripts --no-interaction -q")
+gate "$A2b" passed; collect
+update adventos.test "$A2b"
+check "broken commit with a new package: rolled back, not stuck in maintenance" '[ "$(field result)" = rolled_back ] && [ "$(head_of adventos $A)" = "$A1" ] && [ ! -e $A/storage/framework/down ] && [ "$(status adventos.test /login)" = 200 ]'
+check "the package is gone from vendor and Laravel's package cache" '[ ! -d $A/vendor/spatie/laravel-honeypot ] && ! grep -qs honeypot $A/bootstrap/cache/packages.php'
+
 A3=$(testcommit AdventOS 6.0 "Test: harmless" "echo >> README.md")
 gate "$A3" passed; collect
 runuser -u adventos -- bash -c "echo local >> $A/composer.json"
@@ -99,6 +107,15 @@ V1=$(testcommit vilnius main "Test: harmless" "echo >> README.md")
 gate "$V1" passed; collect
 update vilnius.test "$V1"
 check "updated" '[ "$(field result)" = updated ] && [ "$(head_of vilnius $V)" = "$V1" ] && [ "$(status vilnius.test)" = 200 ]'
+# A database config with a guard that ends any script it was not meant for: the backup must fail
+# rather than come back empty.
+runuser -u vilnius -- cp $V/config/database.local.php $V/config/database.local.php.orig
+runuser -u vilnius -- sed -i "1a if (!defined('ROOT_PATH')) { exit(0); }" $V/config/database.local.php
+V1b=$(testcommit vilnius main "Test: harmless too" "echo >> README.md")
+gate "$V1b" passed; collect
+update vilnius.test "$V1b"
+check "config that exits early: backup refused, nothing changed" '[ "$(field result)" = refused ] && field message | grep -q "backup failed" && [ "$(head_of vilnius $V)" = "$V1" ] && [ "$(status vilnius.test)" = 200 ]'
+runuser -u vilnius -- mv $V/config/database.local.php.orig $V/config/database.local.php
 V2=$(testcommit vilnius main "Test: broken" "sed -i '1a http_response_code(500); exit;' public/index.php")
 gate "$V2" passed; collect
 mariadb vilnius -e "INSERT INTO sentinel VALUES (8)"

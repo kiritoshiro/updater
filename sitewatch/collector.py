@@ -78,6 +78,7 @@ def load_token(config):
 APP_TYPES = ("laravel", "git", "copy")
 APP_NAME = re.compile(r"(?!\.\.?\Z)[A-Za-z0-9._-]{1,100}\Z", re.ASCII)
 REPOSITORY = re.compile(r"[a-zA-Z0-9_.-]+/[a-zA-Z0-9_.-]+\Z", re.ASCII)
+BRANCH = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,99}\Z", re.ASCII)  # never an option to git
 
 
 def relative_file(value):
@@ -90,7 +91,7 @@ def validate_app(site):
     app = site["app"]
     if not isinstance(app, dict) or app.get("type") not in APP_TYPES:
         raise ValueError("app.type must be laravel, git or copy")
-    if not REPOSITORY.fullmatch(str(app.get("repository", ""))) or not APP_NAME.fullmatch(str(app.get("branch", ""))):
+    if not REPOSITORY.fullmatch(str(app.get("repository", ""))) or not BRANCH.fullmatch(str(app.get("branch", ""))):
         raise ValueError("app needs a GitHub repository (owner/name) and a branch")
     database = app.get("database")
     if not isinstance(database, dict) or database.get("format") not in ("env", "php") or not relative_file(database.get("file")):
@@ -141,7 +142,9 @@ def validate_config(config):
         for check_path in site.get("health_paths", ["/", "/wp-login.php"]):
             if not isinstance(check_path, str) or not check_path.startswith("/") or any(c in check_path for c in "\r\n?#"):
                 raise ValueError("Invalid origin health path")
-        if site.get("kind", "wordpress") == "web" and "app" in site:
+        if "app" in site:
+            if site.get("kind") != "web":
+                raise ValueError("An app block belongs on a web site (kind web)")
             validate_app(site)
         if site.get("kind", "wordpress") == "wordpress" or "app" in site:
             if not re.fullmatch(r"[a-z_][a-z0-9_-]{0,31}", site.get("owner", "")):

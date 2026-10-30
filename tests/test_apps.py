@@ -16,8 +16,8 @@ OLD, NEW, OTHER = "a" * 40, "b" * 40, "c" * 40
 REPO = "kiritoshiro/app"
 
 
-def run(path, event="push", status="completed", run_id=1, sha=NEW):
-    return {"id": run_id, "head_sha": sha, "path": path, "event": event, "status": status}
+def run(path, event="push", status="completed", run_id=1, sha=NEW, branch="main"):
+    return {"id": run_id, "head_sha": sha, "head_branch": branch, "path": path, "event": event, "status": status}
 
 
 def job(conclusion="success", status="completed", name="All security checks passed", sha=NEW):
@@ -57,11 +57,15 @@ class GateTests(unittest.TestCase):
         gate = ".github/workflows/security-gate.yml"
         cases = [
             ([run(gate)], {1: [job()]}, "passed"),
-            ([run(".github/workflows/release.yml")], {1: [job(name="security-gate / All security checks passed")]}, "passed"),
+            ([run(gate, branch="feature")], {1: [job()]}, "missing"),      # passed on another branch only
+            ([run(".github/workflows/release.yml")], {1: [job()]}, "missing"),
             ([run(gate)], {1: [job("failure")]}, "failed"),
             ([run(gate)], {1: [job(None, status="in_progress")]}, "pending"),
             ([run(gate, status="in_progress")], {1: []}, "pending"),          # the gate job has not started yet
             ([run(gate, event="pull_request")], {1: [job()]}, "missing"),     # a pull request run never counts
+            ([run(gate, event="pull_request_target")], {1: [job()]}, "missing"),  # nor runs of the default branch's workflow
+            ([run(gate, event="workflow_run")], {1: [job()]}, "missing"),
+            ([run(gate, event="schedule")], {1: [job()]}, "passed"),
             ([run(".github/workflows/other.yml")], {1: [job()]}, "missing"),  # nor does another workflow
             ([run(gate, sha=OTHER)], {1: [job()]}, "missing"),
             ([run(gate)], {1: [job(sha=OTHER)]}, "missing"),
@@ -70,7 +74,7 @@ class GateTests(unittest.TestCase):
         ]
         for runs, jobs, expected in cases:
             with self.subTest(expected=expected, runs=runs):
-                self.assertEqual(gate_state(REPO, NEW, FakeGitHub(runs=runs, jobs=jobs)), expected)
+                self.assertEqual(gate_state(REPO, NEW, "main", FakeGitHub(runs=runs, jobs=jobs)), expected)
 
     def test_message_is_one_clean_line(self):
         self.assertEqual(apps.clean_message("Fix\x1b[31m it\x07\nmore"), "Fix[31m it")
@@ -202,6 +206,7 @@ class FakeApp:
     def __init__(self, site, fail_on=None):
         self.site, self.fail_on = site, fail_on
         self.head, self.branch, self.dirty = OLD, "main", ""
+        self.dump = b"/*M!999999\\- enable the sandbox mode */ \n-- MariaDB dump 10.19\nCREATE TABLE t (id int);\n-- Dump completed on 2026-10-30\n"
         self.calls, self.imported = [], None
 
     def __call__(self, argv, timeout=65, stdin=None, stdout=None):
@@ -216,11 +221,11 @@ class FakeApp:
         if self.fail_on and args[:len(self.fail_on)] == self.fail_on:
             raise CheckFailed("Command failed")
         if args == ["db", "dump"]:
-            stdout.write(b"-- dump")
+            stdout.write(self.dump)
         if args == ["db", "import"]:
             self.imported = stdin.read()
         if args[:2] == ["git", "rev-parse"]:
-            return self.head if args[-1] == "HEAD" else NEW
+            return self.head if args[-1] == "HEAD" else OLD if args[-1] == "refs/heads/main" else NEW
         if args[:2] == ["git", "status"]:
             return self.dirty
         if args[:2] == ["git", "symbolic-ref"]:
@@ -272,7 +277,7 @@ class AppUpdateTests(unittest.TestCase):
         result, fake = self.update()
         self.assertEqual(result["result"], "rolled_back")
         self.assertTrue(fake.ran("git", "checkout", "--quiet", "--force", "-B", "main", OLD))
-        self.assertEqual(fake.imported, b"-- dump")
+        self.assertEqual(fake.imported, fake.dump)
         self.assertEqual(fake.head, OLD)
 
     def test_detached_install_is_put_back_detached(self):
@@ -283,6 +288,20 @@ class AppUpdateTests(unittest.TestCase):
         result, fake = self.update(prepare=detached)
         self.assertEqual(result["result"], "rolled_back")
         self.assertTrue(fake.ran("git", "checkout", "--quiet", "--force", "--detach", OLD))
+        self.assertTrue(fake.ran("git", "update-ref", "refs/heads/main", OLD))  # the branch apply moved is put back
+
+    def test_laravel_rollback_deletes_generated_caches_first(self):
+        cache = self.root / "app/bootstrap/cache"
+        cache.mkdir(parents=True)
+        for name in ("packages.php", "services.php", "routes-v7.php", ".gitignore"):
+            (cache / name).write_text("x")
+        result, fake = self.update("laravel", fail_on=["artisan", "migrate"])
+        self.assertEqual(result["result"], "rolled_back")
+        removal = next(i for i, c in enumerate(fake.calls) if c[:2] == ["/usr/bin/rm", "-f"])
+        self.assertEqual(sorted(Path(p).name for p in fake.calls[removal][3:]), ["packages.php", "routes-v7.php", "services.php"])
+        first_artisan_after = next(i for i, c in enumerate(fake.calls) if i > removal and c[0] == "artisan")
+        self.assertGreater(first_artisan_after, removal)
+        self.assertLess(removal, next(i for i, c in enumerate(fake.calls) if c == ["db", "import"]))
 
     def test_laravel_steps_and_failed_migration(self):
         result, fake = self.update("laravel")
@@ -306,6 +325,8 @@ class AppUpdateTests(unittest.TestCase):
             ({"prepare": lambda fake: setattr(fake, "dirty", " M app.php")}, "local changes"),
             ({"fail_on": ["git", "fetch"]}, "deploy key"),
             ({"fail_on": ["git", "merge-base"]}, "does not build on"),
+            ({"prepare": lambda fake: setattr(fake, "dump", b"-- MariaDB dump\nCREATE TABLE t (id int);\n")}, "backup failed"),
+            ({"prepare": lambda fake: setattr(fake, "dump", b"")}, "backup failed"),
         ]
         for options, message in cases:
             with self.subTest(message):
@@ -313,7 +334,8 @@ class AppUpdateTests(unittest.TestCase):
                 self.assertEqual(result["result"], "refused")
                 self.assertIn(message, result["message"])
                 self.assertFalse(fake.ran("git", "checkout"))
-                self.assertFalse(fake.ran("db", "dump"))
+                if message != "backup failed":  # an incomplete dump is refused after it was taken
+                    self.assertFalse(fake.ran("db", "dump"))
         self.inventory["app"]["update"]["sha"] = OTHER
         result, _ = self.update()
         self.assertIn("does not offer this commit", result["message"])
@@ -334,6 +356,13 @@ class ConfigTests(unittest.TestCase):
                        {"type": "copy", "keep": ["../x"]}):
             with self.subTest(change), self.assertRaises(ValueError):
                 collector.validate_config(self.config(**change))
+        config = self.config(branch="-main")
+        with self.assertRaises(ValueError):
+            collector.validate_config(config)
+        config = self.config()
+        config["sites"][0]["kind"] = "wordpress"  # an app block on a WordPress site is a mistake
+        with self.assertRaises(ValueError):
+            collector.validate_config(config)
         config = self.config()
         del config["sites"][0]["owner"]
         with self.assertRaises(ValueError):

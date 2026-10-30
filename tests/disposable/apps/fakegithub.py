@@ -22,6 +22,11 @@ def git(repo, *args, text=True):
     return subprocess.run(["git", "-C", repo, *args], capture_output=True, check=True, text=text).stdout
 
 
+def branch_of(repo, sha):
+    """The bare repository's only branch (each test repository has one)."""
+    return git(repo, "for-each-ref", "--format=%(refname:short)", "refs/heads/").split()[0]
+
+
 def gate(sha):
     try:
         return json.loads((STATE / "gates.json").read_text()).get(sha, "missing")
@@ -60,7 +65,8 @@ class Handler(BaseHTTPRequestHandler):
                 sha = query.get("head_sha", [""])[0]
                 state = gate(sha)
                 runs = [] if state == "missing" else [
-                    {"id": int(sha[:8], 16), "head_sha": sha, "path": ".github/workflows/security-gate.yml", "event": "push",
+                    {"id": int(sha[:8], 16), "head_sha": sha, "head_branch": query.get("branch", [None])[0] or branch_of(repo, sha),
+                     "path": ".github/workflows/security-gate.yml", "event": "push",
                      "status": "in_progress" if state == "pending" else "completed"}]
                 return self.reply(200, {"workflow_runs": runs})
             m2 = re.fullmatch(r"actions/runs/(\d+)/jobs", rest)

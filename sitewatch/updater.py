@@ -360,7 +360,7 @@ class Updater:
             if kind in ("plugin", "theme", "core", "app") and result["from"] is None:
                 raise Refused("The installed version could not be read")
             archive = self.prepare_release(kind, slug) if result["source"] == "github" else None
-            label = f"{time.strftime('%Y%m%d-%H%M%S')}-{kind}" + (f"-{slug[:12]}" if slug else "")
+            label = f"{time.strftime('%Y%m%d-%H%M%S')}-{kind}" + (f"-{slug[:12] if kind == 'app' else slug}" if slug else "")
             directory, folder, names = self.backup(kind, slug, label)
             self.last_backup = (directory, folder, names)
             result["backup"] = str(directory)
@@ -728,7 +728,7 @@ def main(argv=None):
         else:
             site = next((s for s in config["sites"] if s["id"] == args.site), None)
             if args.kind == "app":
-                if site is None or "app" not in site:
+                if site is None or site.get("kind") != "web" or "app" not in site:
                     raise ValueError("Unknown web app")
             elif site is None or site.get("kind", "wordpress") != "wordpress":
                 raise ValueError("Unknown WordPress site")

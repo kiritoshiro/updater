@@ -26,10 +26,15 @@ from .collector import CheckFailed
 from .updater import UPDATE_LIMIT, Refused, Updater, download
 
 API = "https://api.github.com"
-GATE_JOBS = ("All security checks passed", "security-gate / All security checks passed")
-# Only these workflows may vouch for a commit, and never a pull request run: that one scanned the
-# pull request's merge preview, with fewer checks, not the commit on the branch.
-GATE_WORKFLOWS = (".github/workflows/security-gate.yml", ".github/workflows/release.yml")
+# Only the gate workflow's final job, in a run on the deployed branch itself, vouches for a commit.
+# Not a pull request run (it scanned the merge preview, with fewer checks), nor pull_request_target,
+# workflow_run and the like (they run the default branch's workflow and can report a head they did
+# not scan), nor a run on another branch (a gate may behave differently there).
+GATE_JOBS = ("All security checks passed",)
+GATE_WORKFLOWS = (".github/workflows/security-gate.yml",)
+GATE_EVENTS = ("push", "schedule", "workflow_dispatch")
+# Laravel's generated caches; after a rollback they may name packages the restored vendor lacks.
+LARAVEL_CACHES = re.compile(r"(?:packages|services|config|events|routes(?:-[A-Za-z0-9_]+)?)\.php\Z")
 GATES = ("passed", "failed", "pending", "missing")
 SHA = re.compile(r"[0-9a-f]{40}\Z")
 MAX_APP_ZIP = 128 * 1024 * 1024
@@ -61,13 +66,13 @@ def branch_head(repository, branch, api):
             "message": clean_message(commit.get("message"))}
 
 
-def gate_state(repository, sha, api):
-    """passed, failed, pending or missing: the security gate job on exactly this commit."""
+def gate_state(repository, sha, branch, api):
+    """passed, failed, pending or missing: the security gate job on exactly this commit, on branch."""
     runs = api(f"/repos/{repository}/actions/runs?head_sha={sha}&per_page=50").get("workflow_runs", [])
     seen = set()
     for run in runs if isinstance(runs, list) else []:
         if (not isinstance(run, dict) or run.get("head_sha") != sha or run.get("path") not in GATE_WORKFLOWS
-                or run.get("event") == "pull_request" or type(run.get("id")) is not int):
+                or run.get("event") not in GATE_EVENTS or run.get("head_branch") != branch or type(run.get("id")) is not int):
             continue
         jobs = api(f"/repos/{repository}/actions/runs/{run['id']}/jobs?per_page=100").get("jobs", [])
         found = False
@@ -106,7 +111,8 @@ def record_path(site):
 
 def installed_commit(site, run=collector.run):
     if site["app"]["type"] == "copy":
-        record = json.loads(run(collector.as_owner(site, "/usr/bin/cat", "--", record_path(site))))
+        # head -c: the owner controls this file, so never read more than a record can be
+        record = json.loads(run(collector.as_owner(site, "/usr/bin/head", "-c", "65536", "--", record_path(site))))
         sha = str(record.get("sha", "")) if isinstance(record, dict) else ""
     else:
         sha = run(git_argv(site, "rev-parse", "--verify", "HEAD"))
@@ -131,13 +137,20 @@ def app_inventory(site, token, fetch=collector.fetch_json, run=collector.run):
         result["relation"] = "identical" if head["sha"] == result["commit"] else (
             relation(app["repository"], result["commit"], head["sha"], api) if result["commit"] else None)
         if result["relation"] == "ahead":
-            result["update"] = {**head, "gate": gate_state(app["repository"], head["sha"], api)}
+            result["update"] = {**head, "gate": gate_state(app["repository"], head["sha"], app["branch"], api)}
         elif result["relation"] in ("behind", "diverged"):
             errors.append(f"The installed commit is not on the {app['branch']} branch's history")
         result["check_state"] = "checked"
     except GITHUB_ERRORS:
         errors.append("GitHub update check unavailable")
     return result, errors
+
+
+def complete_dump(first, last):
+    """mariadb-dump and mysqldump write fixed comment lines near the start (newer MariaDB puts a
+    sandbox-mode line first) and at the very end (without --skip-comments)."""
+    lines = first.split(b"\n")[:3]
+    return any(line.startswith((b"-- MariaDB dump", b"-- MySQL dump")) for line in lines) and b"\n-- Dump completed" in last
 
 
 # --- one update -------------------------------------------------------------------------------------
@@ -158,8 +171,8 @@ class AppUpdater(Updater):
     def git(self, *args, limit=60):
         return self.run(git_argv(self.site, *args, limit=limit), timeout=limit + 10)
 
-    def artisan(self, *args):
-        return self.owner(self.app["php"], str(Path(self.site["path"]) / "artisan"), *args, "--no-interaction", limit=UPDATE_LIMIT)
+    def artisan(self, *args, limit=120):
+        return self.owner(self.app["php"], str(Path(self.site["path"]) / "artisan"), *args, "--no-interaction", limit=limit)
 
     def helper(self, *args, **streams):
         """appfiles.py as the owner, from root-owned code."""
@@ -176,7 +189,7 @@ class AppUpdater(Updater):
             head = branch_head(self.app["repository"], self.app["branch"], self.api)
             if head["sha"] != slug:
                 raise Refused(f"The {self.app['branch']} branch has moved on since the last check; refresh and try again")
-            gate = gate_state(self.app["repository"], slug, self.api)
+            gate = gate_state(self.app["repository"], slug, self.app["branch"], self.api)
         except GITHUB_ERRORS as exc:
             raise Refused("GitHub could not be reached to verify the commit") from exc
         if gate != "passed":
@@ -207,6 +220,12 @@ class AppUpdater(Updater):
                 self.added = check_app_archive(data, self.app.get("source", "server"), self.app.get("keep", []))
             except ValueError as exc:
                 raise Refused(f"The commit archive was refused: {exc}") from exc
+            try:  # only the newest commit is installed, also if the branch moved during the download
+                moved = branch_head(self.app["repository"], self.app["branch"], self.api)["sha"] != slug
+            except GITHUB_ERRORS as exc:
+                raise Refused("GitHub could not be reached to verify the commit") from exc
+            if moved:
+                raise Refused(f"The {self.app['branch']} branch has moved on since the last check; refresh and try again")
             self.before = {"sha": current}
             return data
         try:
@@ -216,7 +235,11 @@ class AppUpdater(Updater):
                 branch = self.git("symbolic-ref", "--quiet", "--short", "HEAD")
             except CheckFailed:
                 branch = None  # detached, e.g. by the app's own updater
-            self.before = {"sha": current, "branch": branch}
+            try:  # where the local branch pointed, so a rollback from a detached checkout can put it back
+                local = self.git("rev-parse", "--verify", "--quiet", f"refs/heads/{self.app['branch']}")
+            except CheckFailed:
+                local = None
+            self.before = {"sha": current, "branch": branch, "local": local}
             branch_ref = f"refs/remotes/origin/{self.app['branch']}"
             self.git("fetch", "--no-tags", "--quiet", "origin", f"+refs/heads/{self.app['branch']}:{branch_ref}", limit=300)
             fetched = self.git("rev-parse", "--verify", branch_ref)
@@ -240,7 +263,15 @@ class AppUpdater(Updater):
         return root, []
 
     def export_database(self, stream):
+        """The dump must be complete, from mariadb-dump's first line to its last, or nothing is changed."""
         self.owner(*self.database("dump"), limit=UPDATE_LIMIT, stdout=stream)
+        stream.flush()
+        with open(stream.name, "rb") as dump:
+            first = dump.read(256)
+            dump.seek(max(0, os.fstat(dump.fileno()).st_size - 256))
+            last = dump.read()
+        if not complete_dump(first, last):
+            raise CheckFailed("Incomplete database dump")
 
     def import_database(self, stream):
         self.owner(*self.database("import"), limit=UPDATE_LIMIT, stdin=stream)
@@ -269,9 +300,17 @@ class AppUpdater(Updater):
         if self.app["type"] == "laravel":
             self.owner(self.app["php"], self.app["composer"], "install", "--no-dev", "--prefer-dist", "--no-interaction",
                        "--no-progress", "--optimize-autoloader", f"--working-dir={self.site['path']}", limit=UPDATE_LIMIT)
-            self.artisan("migrate", "--force")
+            self.artisan("migrate", "--force", limit=UPDATE_LIMIT)
             self.rebuild_caches()
             self.artisan("up")
+
+    def clear_laravel_caches(self):
+        """Delete bootstrap/cache's generated files as the owner, before artisan boots the old code:
+        a package the failed commit added would still be listed there and stop artisan from starting."""
+        cache = Path(self.site["path"]) / "bootstrap" / "cache"
+        stale = [str(cache / name) for name in os.listdir(cache) if LARAVEL_CACHES.match(name)] if cache.is_dir() else []
+        if stale:
+            self.owner("/usr/bin/rm", "-f", "--", *stale)
 
     def rebuild_caches(self):
         for command in ("optimize:clear", "config:cache", "route:cache", "view:cache"):
@@ -291,7 +330,16 @@ class AppUpdater(Updater):
         else:
             target = ["-B", self.before["branch"]] if self.before.get("branch") else ["--detach"]
             self.git("checkout", "--quiet", "--force", *target, self.before["sha"])
+            if self.before.get("branch") != self.app["branch"]:
+                # apply moved (or created) the configured branch; put it back as it was
+                branch_ref = f"refs/heads/{self.app['branch']}"
+                if self.before.get("local"):
+                    self.git("update-ref", branch_ref, self.before["local"])
+                else:
+                    self.git("update-ref", "-d", branch_ref)
             self.restore_files(directory, folder, names)
+            if laravel:
+                self.clear_laravel_caches()
         with (directory / "database.sql").open("rb") as stream:
             self.import_database(stream)
         if laravel:

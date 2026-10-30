@@ -4,16 +4,55 @@
 // site-update (root) runs this through sudo -u <owner> with php -n, so it reads the app's own
 // database settings with the owner's rights and root never needs a database password. The
 // password reaches the MariaDB client through MYSQL_PWD (readable only by the owner and root),
-// never a command line. The dump goes to stdout; a restore reads it from stdin and first drops
-// every table and view, so tables a failed update created do not survive the rollback.
+// never a command line. The dump goes to stdout. A restore reads it from stdin, checks it is a
+// complete dump, then drops every table, view, sequence and stored routine, so none that a failed
+// update created survives, and loads it. A connection lost halfway still leaves a partial restore,
+// reported as a failed rollback with the backup kept.
+// .env values are read literally: ${VAR} references are not expanded (the login then fails, safely).
 //
 // php -n appdb.php dump|import env|php <config file> <keys JSON> <expected database name>
 
 declare(strict_types=1);
 
+// Only finish() ends with status 0. If the app's config file ends the script early (exit or die in
+// a guard), the shutdown function discards its output and turns that into a failure.
+$finished = false;
+register_shutdown_function(static function (): void {
+    if (!$GLOBALS['finished']) {
+        while (ob_get_level() > 0) {
+            ob_end_clean();
+        }
+        exit(9);
+    }
+});
+
 function fail(int $code): never
 {
+    $GLOBALS['finished'] = true;
     exit($code);
+}
+
+function finish(int $code): never
+{
+    $GLOBALS['finished'] = true;
+    exit($code);
+}
+
+/** mariadb-dump's first and last lines: a dump without them is cut short or not a dump. */
+function complete_dump($stream): bool
+{
+    rewind($stream);
+    $first = (string) fread($stream, 256);
+    $size = fstat($stream)['size'];
+    fseek($stream, max(0, $size - 256));
+    $last = (string) stream_get_contents($stream);
+    rewind($stream);
+    // Newer MariaDB writes a sandbox-mode line before the header.
+    $header = false;
+    foreach (array_slice(explode("\n", $first), 0, 3) as $line) {
+        $header = $header || str_starts_with($line, '-- MariaDB dump') || str_starts_with($line, '-- MySQL dump');
+    }
+    return $header && str_contains($last, "\n-- Dump completed");
 }
 
 /** Laravel-style .env: KEY=value, KEY="value" or KEY='value'. */
@@ -47,8 +86,9 @@ function env_settings(string $file): array
 /** A PHP file that returns an array; $keys maps host, port, name, user, password to its keys. */
 function php_settings(string $file, array $keys): array
 {
+    ob_start();  // a config that prints anything is refused; nothing of it reaches the dump
     $config = (static fn (string $path) => require $path)($file);
-    if (!is_array($config)) {
+    if (ob_get_clean() !== '' || !is_array($config)) {
         fail(3);
     }
     $settings = [];
@@ -110,13 +150,20 @@ if ($settings['socket'] !== '') {
 }
 
 if ($action === 'dump') {
-    exit(run(array_merge([client('-dump')], $connection, ['--single-transaction', '--quick', '--no-tablespaces',
+    finish(run(array_merge([client('-dump')], $connection, ['--single-transaction', '--quick', '--no-tablespaces',
         '--hex-blob', '--routines', '--triggers', '--', $expected]), $settings, ['file', '/dev/null', 'r'], STDOUT));
+}
+
+// Read the whole dump first and drop nothing unless it is complete.
+$dump = tmpfile();
+if ($dump === false || stream_copy_to_stream(STDIN, $dump) === false || !complete_dump($dump)) {
+    fail(7);
 }
 
 // Drop what is there now, then load the dump, in one client session.
 $list = fopen('php://temp', 'w+');
-$query = "SELECT table_name, table_type FROM information_schema.tables WHERE table_schema = DATABASE()";
+$query = "SELECT table_name, table_type FROM information_schema.tables WHERE table_schema = DATABASE()"
+    . " UNION ALL SELECT routine_name, routine_type FROM information_schema.routines WHERE routine_schema = DATABASE()";
 if (run(array_merge([client('')], $connection, ['--batch', '--skip-column-names', '-e', $query, '--', $expected]),
         $settings, ['file', '/dev/null', 'r'], $list) !== 0) {
     fail(6);
@@ -125,6 +172,7 @@ rewind($list);
 $prefix = "SET FOREIGN_KEY_CHECKS=0;\n";
 while (($line = fgets($list)) !== false) {
     [$table, $type] = array_pad(explode("\t", rtrim($line, "\n")), 2, '');
-    $prefix .= ($type === 'VIEW' ? 'DROP VIEW IF EXISTS ' : 'DROP TABLE IF EXISTS ') . '`' . str_replace('`', '``', $table) . "`;\n";
+    $drop = ['VIEW' => 'VIEW', 'SEQUENCE' => 'SEQUENCE', 'PROCEDURE' => 'PROCEDURE', 'FUNCTION' => 'FUNCTION'][$type] ?? 'TABLE';
+    $prefix .= "DROP $drop IF EXISTS `" . str_replace('`', '``', $table) . "`;\n";
 }
-exit(run(array_merge([client('')], $connection, ['--', $expected]), $settings, STDIN, STDOUT, $prefix));
+finish(run(array_merge([client('')], $connection, ['--', $expected]), $settings, $dump, STDOUT, $prefix));
