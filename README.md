@@ -40,6 +40,7 @@ Use your existing OpenSSH agent and verified host key. On Windows the viewer use
 - Non-WordPress site health checks.
 - Stale/missing/failed snapshots, including retention of the last successful snapshot after a connection failure.
 - Per-site failure isolation, owner-only WP-CLI execution, atomic status replacement and collector locking.
+- Our own web apps (Laravel or plain PHP from Git, or files copied from a GitHub archive): the newest commit of the deployed branch, offered only when the repository's security gate passed on it, with the same backup, health check and rollback.
 - Update buttons for reported plugin, theme and core updates, with confirmation, a recent-updates list from the server's log, and one update at a time (`site-update`, see [docs/UPDATER.md](docs/UPDATER.md)).
 - Manual GitHub Actions checks for Windows/Linux and Python 3.11/3.13.
 

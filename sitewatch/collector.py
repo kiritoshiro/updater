@@ -58,7 +58,62 @@ def load_config(path):
     config = validate_config(json.loads(path.read_text(encoding="utf-8")))
     for ca_file in {site["ca_file"] for site in config["sites"] if site["ca_file"]}:
         check_root_file(ca_file)
+    if config.get("github_token_file"):
+        check_root_file(config["github_token_file"])
+        if Path(config["github_token_file"]).stat().st_mode & 0o077:
+            raise ValueError("The GitHub token file must have mode 0600")
     return config
+
+
+def load_token(config):
+    """Read-only GitHub token for private app repositories, or None. Sent to api.github.com only."""
+    if not config.get("github_token_file"):
+        return None
+    token = Path(config["github_token_file"]).read_text(encoding="ascii").strip()
+    if not re.fullmatch(r"[A-Za-z0-9_]{20,255}", token):
+        raise ValueError("The GitHub token file does not hold a token")
+    return token
+
+
+APP_TYPES = ("laravel", "git", "copy")
+APP_NAME = re.compile(r"(?!\.\.?\Z)[A-Za-z0-9._-]{1,100}\Z", re.ASCII)
+REPOSITORY = re.compile(r"[a-zA-Z0-9_.-]+/[a-zA-Z0-9_.-]+\Z", re.ASCII)
+
+
+def relative_file(value):
+    parts = value.split("/") if isinstance(value, str) else []
+    return bool(parts) and all(APP_NAME.fullmatch(part) for part in parts)
+
+
+def validate_app(site):
+    """A web site we deploy from GitHub: see docs/UPDATER.md, "Web apps"."""
+    app = site["app"]
+    if not isinstance(app, dict) or app.get("type") not in APP_TYPES:
+        raise ValueError("app.type must be laravel, git or copy")
+    if not REPOSITORY.fullmatch(str(app.get("repository", ""))) or not APP_NAME.fullmatch(str(app.get("branch", ""))):
+        raise ValueError("app needs a GitHub repository (owner/name) and a branch")
+    database = app.get("database")
+    if not isinstance(database, dict) or database.get("format") not in ("env", "php") or not relative_file(database.get("file")):
+        raise ValueError("app.database needs format env or php and a file inside the app")
+    if not re.fullmatch(r"[A-Za-z0-9_]{1,64}", str(database.get("name", ""))):
+        raise ValueError("app.database.name must be the expected database name")
+    keys = database.get("keys", {})
+    if not isinstance(keys, dict) or set(keys) - {"host", "port", "name", "user", "password", "socket"} or not all(
+            re.fullmatch(r"[A-Za-z0-9_]{1,64}", str(v)) for v in keys.values()):
+        raise ValueError("app.database.keys maps host, port, name, user and password to the config's own keys")
+    if database["format"] == "php" and not {"name", "user", "password"} <= set(keys):
+        raise ValueError("A php database config needs keys for name, user and password")
+    for key in ("php", "composer"):
+        if key in app and not (isinstance(app[key], str) and app[key].startswith("/") and ".." not in app[key]):
+            raise ValueError(f"app.{key} must be an absolute path")
+    if app["type"] == "copy":
+        if not relative_file(app.get("source", "server")):
+            raise ValueError("app.source must be a folder inside the repository")
+        for key in ("keep", "clear"):
+            if not isinstance(app.get(key, []), list) or not all(APP_NAME.fullmatch(str(n)) for n in app.get(key, [])):
+                raise ValueError(f"app.{key} must list top-level names")
+    app.setdefault("php", "/usr/bin/php8.4")
+    app.setdefault("composer", "/usr/local/bin/composer")
 
 
 def validate_config(config):
@@ -86,7 +141,9 @@ def validate_config(config):
         for check_path in site.get("health_paths", ["/", "/wp-login.php"]):
             if not isinstance(check_path, str) or not check_path.startswith("/") or any(c in check_path for c in "\r\n?#"):
                 raise ValueError("Invalid origin health path")
-        if site.get("kind", "wordpress") == "wordpress":
+        if site.get("kind", "wordpress") == "web" and "app" in site:
+            validate_app(site)
+        if site.get("kind", "wordpress") == "wordpress" or "app" in site:
             if not re.fullmatch(r"[a-z_][a-z0-9_-]{0,31}", site.get("owner", "")):
                 raise ValueError("Set a valid non-root site owner")
             if not Path(site.get("path", "")).is_absolute():
@@ -101,6 +158,9 @@ def validate_config(config):
                     repository is None or re.fullmatch(r"[a-zA-Z0-9_.-]+/[a-zA-Z0-9_.-]+", str(repository))):
                 raise ValueError("Invalid GitHub slug-to-repository mapping")
         site["github"] = {key: repository for key, repository in mapping.items() if repository is not None}
+    token_file = config.get("github_token_file")
+    if token_file is not None and not (isinstance(token_file, str) and token_file.startswith("/") and ".." not in token_file):
+        raise ValueError("github_token_file must be an absolute path")
     patterns = config.get("ignore_failed_units", [])
     if not isinstance(patterns, list) or not all(isinstance(p, str) and re.fullmatch(r"[a-zA-Z0-9@_.*?-]{1,100}", p) for p in patterns):
         raise ValueError("ignore_failed_units must be a list of unit name patterns")
@@ -148,9 +208,12 @@ class NoRedirect(HTTPRedirectHandler):
         return None
 
 
-def fetch_json(url, accept="application/json", limit=256 * 1024):
-    """Small HTTPS JSON read: no redirects, bounded size and time."""
-    request = Request(url, headers={"Accept": accept, "User-Agent": "wp-site-watch/0.1"})
+def fetch_json(url, accept="application/json", limit=256 * 1024, token=None):
+    """Small HTTPS JSON read: no redirects, bounded size and time. A token goes to the GitHub API only."""
+    headers = {"Accept": accept, "User-Agent": "wp-site-watch/0.1"}
+    if token and url.startswith("https://api.github.com/"):
+        headers.update({"Authorization": f"Bearer {token}", "X-GitHub-Api-Version": "2022-11-28"})
+    request = Request(url, headers=headers)
     with build_opener(NoRedirect()).open(request, timeout=12) as response:
         raw = response.read(limit + 1)
     if len(raw) > limit:
@@ -316,6 +379,14 @@ def collect_site(site, config, releases):
         result["flags"] = security_flags(site)
         result["notes"].append("WP-CLI skips regular plugins and themes; must-use plugins and drop-ins can still load, as the site owner.")
         result["notes"].append("No reported update does not verify currency for vendor plugins without a configured GitHub mapping.")
+    elif "app" in site:
+        from .apps import app_inventory
+        try:
+            validate_owner(site)
+            result["app"], app_errors = app_inventory(site, config.get("_token"))
+            errors.extend(app_errors)
+        except CheckFailed:
+            errors.append("App owner or path unavailable")
     paths = site.get("health_paths", ["/", "/wp-login.php"] if result["kind"] == "wordpress" else ["/"])
     for path in paths:
         result["health"].append(origin_health(site["id"], site["origin_ip"], path, site.get("ca_file")))
@@ -408,6 +479,10 @@ def server_info(config):
 
 def collect(config):
     releases = {}
+    try:
+        config["_token"] = load_token(config)
+    except (OSError, ValueError):
+        config["_token"] = None  # private app repositories then show as unchecked
     sites = []
     for site in config["sites"]:
         try:

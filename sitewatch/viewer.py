@@ -63,7 +63,15 @@ class State:
         if type(restore_database) is not bool:
             raise ValueError("Invalid rollback choice")
         site = next((s for s in self.data["sites"] if s["id"] == site_id and s["kind"] == "wordpress"), None)
-        if kind == "core":
+        if kind == "app":
+            app = next((s.get("app") for s in self.data["sites"] if s["id"] == site_id and s["kind"] == "web"), None) or {}
+            offered = app.get("update") or {}
+            if offered.get("sha") != slug or not restore_database:
+                raise ValueError("The current snapshot offers no such commit")
+            if offered.get("gate") != "passed":
+                raise ValueError("The security gate has not passed on this commit")
+            item = {"update_version": slug}
+        elif kind == "core":
             item = (site or {}).get("core") if slug is None else None
         elif kind in ("plugin", "theme"):
             item = next((i for i in (site or {}).get(f"{kind}s", []) if i.get("name") == slug), None)

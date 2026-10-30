@@ -5,10 +5,16 @@ const node = (tag, text, className) => { const el = document.createElement(tag);
 const badge = (text, kind = 'neutral') => node('span', text, `badge ${kind}`);
 const bytes = n => typeof n === 'number' ? `${(n / 1073741824).toFixed(1)} GB` : 'Unknown';
 const date = value => { const d = new Date(value); return Number.isNaN(d.getTime()) ? 'Unknown' : d.toLocaleString(); };
+const short = sha => sha ? String(sha).slice(0, 7) : '?';
+const appName = site => String(site.app?.repository || site.id).split('/').pop();
+const GATE_BADGES = {passed: ['Security check passed', 'good'], failed: ['Security check failed', 'bad'], pending: ['Security check running', 'warn'], missing: ['No security check yet', 'warn']};
 function updates(site) {
   const items = [];
   if (site.core?.update_version) items.push({...site.core, name: 'WordPress core', type: 'core'});
   for (const type of ['plugins', 'themes']) for (const item of site[type] || []) if (item.update_version) items.push({...item, type: type === 'plugins' ? 'plugin' : 'theme'});
+  const app = site.app, next = app?.update;
+  if (next) items.push({type: 'app', name: appName(site), sha: next.sha, gate: next.gate, message: next.message, date: next.date,
+    version: short(app.commit), update_version: short(next.sha), source: `GitHub ${app.repository} · ${app.branch}`});
   return items;
 }
 function attention(site) { return site.state !== 'ok' || !!site.errors?.length; }
@@ -24,7 +30,7 @@ function renderSites() {
     const label = node('div'); label.append(node('div', site.id, 'site-name'), node('div', site.kind === 'wordpress' ? 'WordPress' : 'Web application', 'site-kind')); identity.append(label); tr.append(cell(identity));
     const first = site.health?.[0];
     tr.append(cell(badge(healthy(site) ? `${first?.response_ms ?? '—'} ms` : (site.health?.length ? 'Check failed' : 'Unknown'), healthy(site) ? 'good' : 'warn')));
-    tr.append(cell(node('span', site.kind === 'wordpress' ? site.core?.version || 'Unknown' : '—')));
+    tr.append(cell(node('span', site.kind === 'wordpress' ? site.core?.version || 'Unknown' : site.app ? `${appName(site)} ${short(site.app.commit)}` : '—')));
     const count = updates(site).length;
     tr.append(cell(badge(count ? `${count} available` : 'None reported', count ? 'warn' : 'neutral')));
     const flag = site.flags?.DISALLOW_FILE_MODS;
@@ -79,8 +85,10 @@ function renderServer() {
   }
 }
 const RESULT_BADGES = {updated: ['Updated', 'good'], unchanged: ['No change', 'neutral'], refused: ['Refused', 'neutral'], rolled_back: ['Rolled back', 'warn'], rollback_failed: ['Rollback failed', 'bad']};
-function canUpdate(item) { return !!payload?.capabilities?.updates && ['plugin', 'theme', 'core'].includes(item.type); }
-function itemLabel(r) { return r.kind === 'core' ? 'WordPress core' : r.kind === 'translations' ? 'Translations' : r.slug; }
+// An app commit can only be installed once its repository's security gate passed on it.
+function canUpdate(item) { return !!payload?.capabilities?.updates && (['plugin', 'theme', 'core'].includes(item.type) || (item.type === 'app' && item.gate === 'passed')); }
+function itemLabel(r) { return r.kind === 'core' ? 'WordPress core' : r.kind === 'translations' ? 'Translations' : r.kind === 'app' ? `App commit ${short(r.slug)}` : r.slug; }
+const restoresAll = item => ['core', 'app'].includes(item.type);
 // The last action's result stays visible across re-renders (auto-load every minute) until the next action.
 let notice = null;
 function showBanner(text, error) { notice = {text, error}; $('banner').textContent = text; $('banner').hidden = false; $('banner').classList.toggle('error', error); $('banner').scrollIntoView({block: 'nearest', behavior: 'smooth'}); }
@@ -91,7 +99,8 @@ async function postUpdate(site, item, restoreDatabase) {
   // One update; returns its result (or {result:'failed', message}) and re-renders with the reply.
   try {
     const response = await fetch('/api/update', {method: 'POST', headers: {'Content-Type': 'application/json', 'X-Site-Watch-Token': payload.refresh_token},
-      body: JSON.stringify({site: site.id, kind: item.type, slug: item.type === 'core' ? null : item.name, restore_database: item.type === 'core' ? true : restoreDatabase})});
+      body: JSON.stringify({site: site.id, kind: item.type, slug: item.type === 'core' ? null : item.type === 'app' ? item.sha : item.name,
+        restore_database: restoresAll(item) ? true : restoreDatabase})});
     const data = await response.json();
     if ('status' in data) render(data);
     return data.results?.[data.results.length - 1] || {result: 'failed', message: data.error || 'The update request failed'};
@@ -101,9 +110,11 @@ async function postUpdate(site, item, restoreDatabase) {
 }
 const ok = r => ['updated', 'unchanged'].includes(r.result);
 async function runUpdate(site, item) {
-  // Core always restores the database: update-db upgrades it, and old core files on it are no rollback.
-  const answer = await ask({title: `Update ${label(item)} on ${site.id}?`, ok: 'Update', option: item.type !== 'core',
-    text: `${item.version || '?'} → ${item.update_version}. A backup of its files and the database is taken first. If the site fails its health check afterwards, the backup is restored automatically.`});
+  // Core and apps always restore the database: their updates migrate it, and old code on it is no rollback.
+  const text = item.type === 'app'
+    ? `Commit ${item.version} → ${item.update_version}${item.message ? ` (“${item.message}”)` : ''}, the newest on ${site.app.branch}; its security check passed. The database and the app's files are backed up first. If the update fails or the site fails its health check afterwards, the previous commit, files and database are restored automatically.`
+    : `${item.version || '?'} → ${item.update_version}. A backup of its files and the database is taken first. If the site fails its health check afterwards, the backup is restored automatically.`;
+  const answer = await ask({title: `Update ${label(item)} on ${site.id}?`, ok: 'Update', option: !restoresAll(item), text});
   if (!answer) return;
   updating = true; renderUpdates();
   showBanner(`Updating ${label(item)} on ${site.id}. This can take a few minutes; keep this page open.`, false);
@@ -122,7 +133,7 @@ async function runSelected() {
   const sites = new Set(chosen.map(({site}) => site.id));
   const major = item => item.type === 'core' && String(item.version).split('.').slice(0, 2).join('.') !== String(item.update_version).split('.').slice(0, 2).join('.');
   const answer = await ask({title: `Update ${chosen.length} item${chosen.length > 1 ? 's' : ''} on ${sites.size} site${sites.size > 1 ? 's' : ''}?`, ok: 'Update all',
-    option: chosen.some(({item}) => item.type !== 'core'),
+    option: chosen.some(({item}) => !restoresAll(item)),
     items: chosen.map(({site, item}) => [`${label(item)} ${item.version || '?'} → ${item.update_version} · ${site.id}${major(item) ? ' · NEW MAJOR VERSION' : ''}`, major(item)]),
     text: 'They run one after another, each with its own backup, health check and automatic rollback. If one fails on a site, the rest of that site’s selection is skipped; other sites continue. Keep this page open.'});
   if (!answer) return;
@@ -194,12 +205,13 @@ function renderHistory() {
     const row = node('div', undefined, 'update-item'), name = node('div', itemLabel(r));
     name.append(node('small', `${r.site} · ${date(r.time)} · ${r.user || 'unknown user'}`), node('small', r.message));
     const [text, kind] = RESULT_BADGES[r.result] || [r.result, 'neutral'], side = node('div', undefined, 'update-actions');
-    if (r.from && r.to && r.from !== r.to) side.append(node('span', `${r.from} → ${r.to}`, 'version-change'));
+    const v = value => r.kind === 'app' ? short(value) : value;
+    if (r.from && r.to && r.from !== r.to) side.append(node('span', `${v(r.from)} → ${v(r.to)}`, 'version-change'));
     side.append(badge(text, kind)); row.append(name, side); list.append(row);
   }
   if (!history.length) list.append(node('p', 'No updates have been run from Site Watch yet.', 'detail-note'));
 }
-const GROUPS = [['core', 'WordPress core'], ['plugin', 'Plugins'], ['theme', 'Themes']];
+const GROUPS = [['core', 'WordPress core'], ['plugin', 'Plugins'], ['theme', 'Themes'], ['app', 'Web apps']];
 function grouped() {
   return GROUPS.map(([type, title]) => [type, title, (snapshot?.sites || []).flatMap(site => updates(site).filter(item => item.type === type).map(item => ({site, item})))]);
 }
@@ -214,17 +226,22 @@ function renderUpdates() {
     if (!entries.length) continue;
     const head = node('div', undefined, 'update-group-head'), heading = node('h3', `${title} `);
     heading.append(node('span', String(entries.length), 'count'));
-    if (enabled) {
-      const all = entries.every(({site, item}) => selected.has(key(site, item)));
-      const box = checkbox(all, `Select all ${title.toLowerCase()}`, on => { for (const {site, item} of entries) on ? selected.add(key(site, item)) : selected.delete(key(site, item)); renderUpdates(); });
+    const selectable = entries.filter(({item}) => canUpdate(item));
+    if (selectable.length) {
+      const all = selectable.every(({site, item}) => selected.has(key(site, item)));
+      const box = checkbox(all, `Select all ${title.toLowerCase()}`, on => { for (const {site, item} of selectable) on ? selected.add(key(site, item)) : selected.delete(key(site, item)); renderUpdates(); });
       const pick = node('label', undefined, 'select-all'); pick.append(box, node('span', 'Select all')); head.append(heading, pick);
     } else head.append(heading);
     list.append(head);
     for (const {site, item} of entries) {
       const row = node('div', undefined, 'update-item'), name = node('div', undefined, 'update-name'), side = node('div', undefined, 'update-actions');
-      if (enabled) name.append(checkbox(selected.has(key(site, item)), `Select ${label(item)} on ${site.id}`, on => { on ? selected.add(key(site, item)) : selected.delete(key(site, item)); renderSelection(); }));
-      const text = node('div', label(item)); text.append(node('small', `${site.id} · ${item.source || 'wordpress.org'}`)); name.append(text);
+      if (canUpdate(item)) name.append(checkbox(selected.has(key(site, item)), `Select ${label(item)} on ${site.id}`, on => { on ? selected.add(key(site, item)) : selected.delete(key(site, item)); renderSelection(); }));
+      else if (enabled) name.append(node('span', '', 'checkbox-gap'));
+      const text = node('div', label(item)); text.append(node('small', `${site.id} · ${item.source || 'wordpress.org'}`));
+      if (item.type === 'app' && item.message) text.append(node('small', `${item.message}${item.date ? ` · ${date(item.date)}` : ''}`));
+      name.append(text);
       side.append(node('span', `${item.version || '?'} → ${item.update_version}`, 'version-change'));
+      if (item.type === 'app') { const [gateText, gateKind] = GATE_BADGES[item.gate] || ['Unknown check', 'warn']; side.append(badge(gateText, gateKind)); }
       if (canUpdate(item)) {
         const button = node('button', 'Update', 'filter update-button'); button.disabled = busy;
         button.setAttribute('aria-label', `Update ${label(item)} on ${site.id}`); button.addEventListener('click', () => runUpdate(site, item)); side.append(button);
@@ -263,6 +280,13 @@ function showDetail(site) {
   if (site.kind === 'wordpress') {
     const setting = payload?.nightly?.[site.id];
     body.append(node('p', payload?.nightly == null ? 'Nightly updates: unknown (the switch file could not be read).' : setting?.enabled ? `Nightly updates are on (since ${date(setting.changed_at)}${setting.by ? `, ${setting.by}` : ''}).` : 'Nightly updates are off.', 'detail-note'));
+  }
+  if (site.app) {
+    const app = site.app, next = app.update;
+    body.append(node('h3', 'Web app'));
+    body.append(node('p', `${app.repository} · branch ${app.branch} · ${app.type} deploy. Installed commit ${short(app.commit)}.`, 'detail-note'));
+    body.append(node('p', next ? `Newer commit ${short(next.sha)}${next.message ? ` (“${next.message}”)` : ''}: ${(GATE_BADGES[next.gate] || ['security check unknown'])[0].toLowerCase()}.`
+      : app.check_state === 'checked' ? 'Up to date with the branch.' : 'The branch could not be checked.', next?.gate === 'passed' || !next ? 'detail-note' : 'detail-error'));
   }
   body.append(node('h3', 'Origin checks'));
   for (const h of site.health || []) {const row = node('div', undefined, 'update-item'); row.append(node('span', h.path), badge(`${h.status || 'Failed'} · ${h.response_ms ?? '—'} ms`, h.ok ? 'good' : 'bad')); body.append(row);}

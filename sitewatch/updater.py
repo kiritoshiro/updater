@@ -1,4 +1,5 @@
-"""Validated WordPress updates: backup, update as the site owner, origin health check, rollback.
+"""Validated WordPress and web app updates: backup, update as the site owner, origin health check,
+rollback. Web apps (our own, deployed from GitHub) are in apps.py.
 
 Root runs this through one sudoers rule (docs/UPDATER.md). Every argument is checked against the
 collector's configuration and last inventory; nothing reaches WP-CLI as free text. Site files and
@@ -36,7 +37,7 @@ BACKUP_ROOT = Path("/var/backups/site-update")
 WATCHER = Path("/usr/local/sbin/site-watch")
 LOG_NAME = "update-log.jsonl"
 NIGHTLY_NAME = "nightly.json"
-KINDS = ("plugin", "theme", "core", "translations", "all")
+KINDS = ("plugin", "theme", "core", "translations", "all", "app")
 KEEP_DAYS = 7
 KEEP_LOG_LINES = 1000
 MIN_FREE_BYTES = 2 * 1024 ** 3
@@ -112,7 +113,7 @@ class NoForeignRedirect(HTTPRedirectHandler):
 def github_host(url):
     parts = urlsplit(url)
     host = parts.hostname or ""
-    return parts.scheme == "https" and (host == "github.com" or host.endswith(".githubusercontent.com"))
+    return parts.scheme == "https" and (host in ("github.com", "codeload.github.com") or host.endswith(".githubusercontent.com"))
 
 
 def download(url, limit=MAX_ZIP_BYTES):
@@ -184,8 +185,9 @@ class Updater:
         self.say = quietly(say)
         self.interrupted = False
         self.release, self.fetch = release, fetch
+        paths = site.get("health_paths", ["/", "/wp-login.php"] if site.get("kind", "wordpress") == "wordpress" else ["/"])
         self.health = health or (lambda: [collector.origin_health(site["id"], site["origin_ip"], path, site.get("ca_file"))
-                                          for path in site.get("health_paths", ["/", "/wp-login.php"])])
+                                          for path in paths])
 
     def wp(self, *args, limit=60, **streams):
         return self.run(collector.wp_argv(self.site, *args, limit=limit), timeout=limit + 10, **streams)
@@ -262,7 +264,7 @@ class Updater:
                 raise OSError("No free backup folder name")
             with (directory / "database.sql").open("xb") as stream:
                 os.fchmod(stream.fileno(), 0o600)
-                self.wp("db", "export", "-", limit=UPDATE_LIMIT, stdout=stream)
+                self.export_database(stream)
             if names:
                 with (directory / "files.tar").open("xb") as stream:
                     os.fchmod(stream.fileno(), 0o600)
@@ -274,27 +276,39 @@ class Updater:
             raise Refused("The backup failed; nothing was updated") from exc
         return directory, folder, names
 
+    def export_database(self, stream):
+        self.wp("db", "export", "-", limit=UPDATE_LIMIT, stdout=stream)
+
+    def import_database(self, stream):
+        self.wp("db", "import", "-", limit=UPDATE_LIMIT, stdin=stream)
+
     def restore(self, directory, folder, names):
-        """Put the backed-up files and database back. Everything runs as the site owner. Backed-up
-        folders are moved aside first, so files the new version added do not survive the rollback."""
-        if names:
-            aside = []
-            for name in names:
-                if (folder / name).is_dir() and not (folder / name).is_symlink():
-                    aside.append(str(folder / f".{name}.site-update-failed"))
-                    self.owner("/usr/bin/rm", "-rf", "--one-file-system", "--", aside[-1])
-                    self.owner("/usr/bin/mv", "-T", "--", str(folder / name), aside[-1])
-            with (directory / "files.tar").open("rb") as stream:
-                self.owner("/usr/bin/tar", "-C", str(folder), "-xf", "-", stdin=stream)
-            for path in aside:
-                self.owner("/usr/bin/rm", "-rf", "--one-file-system", "--", path)
+        """Put the backed-up files and database back. Everything runs as the site owner."""
+        self.restore_files(directory, folder, names)
         if self.restore_database:
             with (directory / "database.sql").open("rb") as stream:
-                self.wp("db", "import", "-", limit=UPDATE_LIMIT, stdin=stream)
+                self.import_database(stream)
         try:
             self.wp("maintenance-mode", "deactivate")
         except CheckFailed:
             pass  # not in maintenance mode
+
+    def restore_files(self, directory, folder, names, also=(), everything=False):
+        """Backed-up folders are moved aside first, so files the new version added do not survive
+        the rollback. With everything, files and links too, and also the names in also (top-level
+        names only the new version has)."""
+        aside = []
+        for name in sorted(set(names) | set(also)):
+            path = folder / name
+            if (everything and os.path.lexists(path)) or (path.is_dir() and not path.is_symlink()):
+                aside.append(str(folder / f".{name}.site-update-failed"))
+                self.owner("/usr/bin/rm", "-rf", "--one-file-system", "--", aside[-1])
+                self.owner("/usr/bin/mv", "-T", "--", str(path), aside[-1])
+        if names:
+            with (directory / "files.tar").open("rb") as stream:
+                self.owner("/usr/bin/tar", "-C", str(folder), "-xf", "-", stdin=stream)
+        for path in aside:
+            self.owner("/usr/bin/rm", "-rf", "--one-file-system", "--", path)
 
     def apply(self, kind, slug, source, archive=None):
         if kind == "translations":
@@ -343,10 +357,10 @@ class Updater:
             if not ok:
                 raise Refused("The site fails its origin health check before the update; fix that first")
             result["from"] = self.version(kind, slug)
-            if kind in ("plugin", "theme", "core") and result["from"] is None:
+            if kind in ("plugin", "theme", "core", "app") and result["from"] is None:
                 raise Refused("The installed version could not be read")
             archive = self.prepare_release(kind, slug) if result["source"] == "github" else None
-            label = f"{time.strftime('%Y%m%d-%H%M%S')}-{kind}" + (f"-{slug}" if slug else "")
+            label = f"{time.strftime('%Y%m%d-%H%M%S')}-{kind}" + (f"-{slug[:12]}" if slug else "")
             directory, folder, names = self.backup(kind, slug, label)
             self.last_backup = (directory, folder, names)
             result["backup"] = str(directory)
@@ -660,13 +674,14 @@ def nightly_run(config, say, results, user="nightly"):
 
 
 def describe(r):
-    target = r["kind"] + (f" {r['slug']}" if r["slug"] else "")
-    versions = f" {r['from']} → {r['to']}" if r.get("from") and r.get("to") and r["from"] != r["to"] else ""
+    short = lambda value: value[:7] if r["kind"] == "app" and value else value
+    target = r["kind"] + (f" {short(r['slug'])}" if r["slug"] else "")
+    versions = f" {short(r['from'])} → {short(r['to'])}" if r.get("from") and r.get("to") and r["from"] != r["to"] else ""
     return f"{r['site']} {target}{versions}: {r['result'].upper()}. {r['message']}."
 
 
 def main(argv=None):
-    parser = argparse.ArgumentParser(prog="site-update", description="Validated WordPress update with backup and rollback")
+    parser = argparse.ArgumentParser(prog="site-update", description="Validated WordPress or web app update with backup and rollback")
     parser.add_argument("--json", action="store_true", help="print one JSON line for the dashboard")
     parser.add_argument("--files-only-rollback", action="store_true",
                         help="if the update fails, restore the files but leave the database as it is")
@@ -683,6 +698,11 @@ def main(argv=None):
     elif args.kind == "nightly":
         if args.slug not in ("on", "off") or args.files_only_rollback:
             parser.error("nightly takes on or off")
+    elif args.kind == "app":
+        if not re.fullmatch(r"[0-9a-f]{40}", args.slug or ""):
+            parser.error("app takes the full commit to install")
+        if args.files_only_rollback:
+            parser.error("an app rollback always restores the database (migrations may have changed it)")
     elif (args.kind in ("plugin", "theme")) != (args.slug is not None) or (args.slug and not SLUG.fullmatch(args.slug)):
         parser.error("plugin and theme need one valid slug; core, translations and all take none")
     elif args.files_only_rollback and args.kind == "core":
@@ -707,7 +727,10 @@ def main(argv=None):
             skipped_sites = nightly_run(config, say, results, user if sudo_user else "nightly")
         else:
             site = next((s for s in config["sites"] if s["id"] == args.site), None)
-            if site is None or site.get("kind", "wordpress") != "wordpress":
+            if args.kind == "app":
+                if site is None or "app" not in site:
+                    raise ValueError("Unknown web app")
+            elif site is None or site.get("kind", "wordpress") != "wordpress":
                 raise ValueError("Unknown WordPress site")
             if args.kind == "nightly":
                 setting = write_nightly(STATE_DIR, site["id"], args.slug == "on", user)
@@ -720,7 +743,11 @@ def main(argv=None):
             private_directory(BACKUP_ROOT)
             with update_lock(STATE_DIR, say, DASHBOARD_LOCK_WAIT if args.json else LOCK_WAIT):
                 prune_backups(BACKUP_ROOT)
-                updater = Updater(site, inventory, say=say, restore_database=not args.files_only_rollback)
+                if args.kind == "app":
+                    from .apps import AppUpdater
+                    updater = AppUpdater(site, inventory, token=collector.load_token(config), say=say)
+                else:
+                    updater = Updater(site, inventory, say=say, restore_database=not args.files_only_rollback)
                 run_items(updater, updater.pending() if args.kind == "all" else [(args.kind, args.slug)], user, say, results)
                 if not results:
                     say("No plugin or theme updates in the last inventory.")

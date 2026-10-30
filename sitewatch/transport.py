@@ -7,9 +7,9 @@ import re
 import subprocess
 from pathlib import Path
 
-from .model import DOMAIN, SLUG, decode_status
+from .model import COMMIT, DOMAIN, SLUG, decode_status
 
-UPDATE_KINDS = ("plugin", "theme", "core", "translations")
+UPDATE_KINDS = ("plugin", "theme", "core", "translations", "app")
 RESULTS = ("updated", "unchanged", "refused", "rolled_back", "rollback_failed")
 
 
@@ -58,7 +58,10 @@ def fetch_file(path):
 def update_command(config, site, kind, slug=None, restore_database=True):
     if not isinstance(site, str) or not DOMAIN.fullmatch(site) or kind not in UPDATE_KINDS:
         raise ValueError("Invalid site or update kind")
-    if (kind in ("plugin", "theme")) != (slug is not None) or (slug is not None and not (isinstance(slug, str) and SLUG.fullmatch(slug))):
+    if kind == "app":
+        if not (isinstance(slug, str) and COMMIT.fullmatch(slug)) or restore_database is not True:
+            raise ValueError("An app update names a full commit and always restores the database")
+    elif (kind in ("plugin", "theme")) != (slug is not None) or (slug is not None and not (isinstance(slug, str) and SLUG.fullmatch(slug))):
         raise ValueError("Invalid component")
     if type(restore_database) is not bool:
         raise ValueError("Invalid rollback choice")
